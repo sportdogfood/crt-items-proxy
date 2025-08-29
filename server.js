@@ -46,6 +46,69 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
 
+
+// -------- Global manifest of items/ --------
+const RAW_RE = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/;
+const m = RAW_RE.exec(UPSTREAM_BASE);
+let GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH;
+if (m) {
+  [, GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH] = m;
+} else {
+  console.warn('UPSTREAM_BASE is not a raw.githubusercontent.com URL; manifest will be disabled.');
+}
+// List JSON files in a directory via GitHub API (cached for 24h)
+async function listDir(dir) {
+  if (!GH_OWNER) throw new Error('Manifest unavailable (UPSTREAM_BASE not raw.github...)');
+  const key = `__index__/${dir}`;
+  const now = Date.now();
+  const cached = memoryCache.get(key);
+  const TTL_MS = 24 * 60 * 60 * 1000;
+  if (cached && (now - cached.fetchedAt) < TTL_MS) return cached.body;
+
+  const api = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_BASEPATH}/${dir}?ref=${encodeURIComponent(GH_BRANCH)}`;
+  const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'crt-items-proxy' };
+  if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+
+  const r = await fetch(api, { headers });
+  if (!r.ok) throw new Error(`GitHub list error ${r.status}: ${await r.text()}`);
+  const json = await r.json();
+
+  const files = Array.isArray(json)
+    ? json
+        .filter(x => x.type === 'file' && /\.json$/i.test(x.name))
+        .map(x => x.name.replace(/\.json$/i, ''))
+        .sort()
+    : [];
+
+  const body = { dir, count: files.length, files };
+  memoryCache.set(key, { body, fetchedAt: now });
+  return body;
+}
+
+app.get('/items/manifest.json', async (_req, res) => {
+  try {
+    if (!GH_OWNER) return res.status(501).json({ error: 'Manifest disabled for non-raw UPSTREAM_BASE' });
+
+    const entries = await Promise.all(
+      Array.from(ALLOW_DIRS).map(async dir => {
+        try {
+          const idx = await listDir(dir);
+          return [dir, idx];
+        } catch {
+          return [dir, { dir, count: 0, files: [] }];
+        }
+      })
+    );
+    res.json({
+      generated_at: new Date().toISOString(),
+      upstream: { owner: GH_OWNER, repo: GH_REPO, branch: GH_BRANCH, basepath: GH_BASEPATH },
+      dirs: Object.fromEntries(entries)
+    });
+  } catch (e) {
+    console.error('Manifest error:', e);
+    res.status(500).json({ error: 'Manifest failed' });
+  }
+});
 // proxy: /items/<dir>/<file>.json
 app.get("/items/*", async (req, res) => {
   try {
@@ -158,69 +221,6 @@ app.post('/items/commit', async (req, res) => {
     res.status(500).json({ error: 'Commit failed' });
   }
 });
-// -------- Global manifest of items/ --------
-const RAW_RE = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/;
-const m = RAW_RE.exec(UPSTREAM_BASE);
-let GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH;
-if (m) {
-  [, GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH] = m;
-} else {
-  console.warn('UPSTREAM_BASE is not a raw.githubusercontent.com URL; manifest will be disabled.');
-}
-// List JSON files in a directory via GitHub API (cached for 24h)
-async function listDir(dir) {
-  if (!GH_OWNER) throw new Error('Manifest unavailable (UPSTREAM_BASE not raw.github...)');
-  const key = `__index__/${dir}`;
-  const now = Date.now();
-  const cached = memoryCache.get(key);
-  const TTL_MS = 24 * 60 * 60 * 1000;
-  if (cached && (now - cached.fetchedAt) < TTL_MS) return cached.body;
-
-  const api = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_BASEPATH}/${dir}?ref=${encodeURIComponent(GH_BRANCH)}`;
-  const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'crt-items-proxy' };
-  if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
-
-  const r = await fetch(api, { headers });
-  if (!r.ok) throw new Error(`GitHub list error ${r.status}: ${await r.text()}`);
-  const json = await r.json();
-
-  const files = Array.isArray(json)
-    ? json
-        .filter(x => x.type === 'file' && /\.json$/i.test(x.name))
-        .map(x => x.name.replace(/\.json$/i, ''))
-        .sort()
-    : [];
-
-  const body = { dir, count: files.length, files };
-  memoryCache.set(key, { body, fetchedAt: now });
-  return body;
-}
-
-app.get('/items/manifest.json', async (_req, res) => {
-  try {
-    if (!GH_OWNER) return res.status(501).json({ error: 'Manifest disabled for non-raw UPSTREAM_BASE' });
-
-    const entries = await Promise.all(
-      Array.from(ALLOW_DIRS).map(async dir => {
-        try {
-          const idx = await listDir(dir);
-          return [dir, idx];
-        } catch {
-          return [dir, { dir, count: 0, files: [] }];
-        }
-      })
-    );
-    res.json({
-      generated_at: new Date().toISOString(),
-      upstream: { owner: GH_OWNER, repo: GH_REPO, branch: GH_BRANCH, basepath: GH_BASEPATH },
-      dirs: Object.fromEntries(entries)
-    });
-  } catch (e) {
-    console.error('Manifest error:', e);
-    res.status(500).json({ error: 'Manifest failed' });
-  }
-});
-
 // boot
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
