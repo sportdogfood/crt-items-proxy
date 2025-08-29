@@ -106,6 +106,7 @@ app.get(['/manifest.json', '/items/manifest.json'], async (_req, res) => {
         }
       })
     );
+
     res.json({
       generated_at: new Date().toISOString(),
       upstream: { owner: GH_OWNER, repo: GH_REPO, branch: GH_BRANCH, basepath: GH_BASEPATH },
@@ -116,6 +117,7 @@ app.get(['/manifest.json', '/items/manifest.json'], async (_req, res) => {
     res.status(500).json({ error: 'Manifest failed' });
   }
 });
+
 // proxy: /items/<dir>/<file>.json
 app.get("/items/*", async (req, res) => {
   try {
