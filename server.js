@@ -47,14 +47,21 @@ app.get("/health", (_req, res) => {
 });
 
 
+
 // -------- Global manifest of items/ --------
 const RAW_RE = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/;
 const m = RAW_RE.exec(UPSTREAM_BASE);
 let GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH;
+
+// Always log what we got for UPSTREAM_BASE
+console.log(`[startup] UPSTREAM_BASE='${UPSTREAM_BASE}'`);
+console.log(`[startup] ALLOW_DIRS=${Array.from(ALLOW_DIRS).join(',')}`);
+
 if (m) {
   [, GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH] = m;
+  console.log(`[manifest] enabled for ${GH_OWNER}/${GH_REPO}@${GH_BRANCH} base='${GH_BASEPATH}'`);
 } else {
-  console.warn('UPSTREAM_BASE is not a raw.githubusercontent.com URL; manifest will be disabled.');
+  console.warn('[manifest] disabled: UPSTREAM_BASE is not raw.githubusercontent.com');
 }
 // List JSON files in a directory via GitHub API (cached for 24h)
 async function listDir(dir) {
@@ -85,7 +92,7 @@ async function listDir(dir) {
   return body;
 }
 
-app.get('/items/manifest.json', async (_req, res) => {
+app.get(['/manifest.json', '/items/manifest.json'], async (_req, res) => {
   try {
     if (!GH_OWNER) return res.status(501).json({ error: 'Manifest disabled for non-raw UPSTREAM_BASE' });
 
