@@ -103,6 +103,61 @@ app.get("/items/*", async (req, res) => {
     res.status(500).json({ error: "Proxy failed" });
   }
 });
+// --- Minimal GitHub commit endpoint (with path normalization) ---
+app.post('/items/commit', async (req, res) => {
+  try {
+    let { path, json, message } = req.body;
+    if (!path || !json) return res.status(400).json({ error: 'path and json required' });
+
+    // Accept either "airports/lex.json" or "items/airports/lex.json"
+    let rel = String(path).replace(/^\/+/, '').replace(/^items\//, '');
+
+    // Validate against allowed dirs & *.json
+    if (!isAllowedPath(rel)) return res.status(400).json({ error: 'Path not allowed' });
+
+    const repo = process.env.GITHUB_REPO;      // e.g. "sportdogfood/clear-round-datasets"
+    const branch = process.env.GITHUB_BRANCH || 'main'; // set to "gh-pages" if that's what you serve
+    const token = process.env.GITHUB_TOKEN;
+    if (!repo || !token) return res.status(500).json({ error: 'Missing GITHUB_REPO or GITHUB_TOKEN' });
+
+    // Commit to items/<rel> inside the repo
+    const repoPath = `items/${rel}`;
+    const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
+    const headers = {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github+json',
+      'User-Agent': 'crt-items-proxy'
+    };
+
+    // Look up existing SHA (if file already exists)
+    let sha;
+    const head = await fetch(`${api}?ref=${encodeURIComponent(branch)}`, { headers });
+    if (head.ok) {
+      const meta = await head.json();
+      sha = meta.sha;
+    }
+
+    const content = Buffer.from(JSON.stringify(json, null, 2)).toString('base64');
+    const body = { message: message || `chore: update ${repoPath}`, content, branch };
+    if (sha) body.sha = sha;
+
+    const put = await fetch(api, { method: 'PUT', headers, body: JSON.stringify(body) });
+    const result = await put.json();
+    if (!put.ok) return res.status(put.status).json(result);
+
+    // Bust proxy cache (cache key uses rel)
+    memoryCache.delete(rel);
+
+    res.json({
+      ok: true,
+      path: repoPath,
+      commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url }
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Commit failed' });
+  }
+});
 
 // boot
 const PORT = process.env.PORT || 3000;
