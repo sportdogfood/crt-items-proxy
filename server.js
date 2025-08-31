@@ -64,7 +64,7 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
 
-// -------- Global manifest of items/ --------
+// -------- Generated manifest (JSON index of allowed dirs) --------
 const RAW_RE = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/;
 const m = RAW_RE.exec(UPSTREAM_BASE);
 let GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH;
@@ -99,7 +99,7 @@ async function listDir(dir) {
 
   const files = Array.isArray(json)
     ? json
-        .filter(x => x.type === "file" && /\.json$/i.test(x.name)) // manifest lists JSON files only
+        .filter(x => x.type === "file" && /\.json$/i.test(x.name)) // index lists JSON files only
         .map(x => x.name.replace(/\.json$/i, ""))
         .sort()
     : [];
@@ -109,7 +109,9 @@ async function listDir(dir) {
   return body;
 }
 
-app.get(["/manifest.json", "/items/manifest.json"], async (_req, res) => {
+// NOTE: moved OFF /items/manifest.json to avoid clashing with real file paths.
+// New endpoints: /_manifest.json and /items/_manifest.json
+app.get(["/_manifest.json", "/items/_manifest.json"], async (_req, res) => {
   try {
     if (!GH_OWNER) return res.status(501).json({ error: "Manifest disabled for non-raw UPSTREAM_BASE" });
 
@@ -124,6 +126,7 @@ app.get(["/manifest.json", "/items/manifest.json"], async (_req, res) => {
       })
     );
 
+    res.set("X-CRT-Manifest", "generated");
     res.json({
       generated_at: new Date().toISOString(),
       upstream: { owner: GH_OWNER, repo: GH_REPO, branch: GH_BRANCH, basepath: GH_BASEPATH },
