@@ -1,4 +1,4 @@
-﻿const express = require("express");
+const express = require("express");
 const fetch = require("node-fetch");
 const cors = require("cors");
 const morgan = require("morgan");
@@ -8,7 +8,7 @@ require("dotenv").config();
 const app = express();
 
 // --- Config via env ---
-const UPSTREAM_BASE = process.env.UPSTREAM_BASE; // e.g. https://raw.githubusercontent.com/sportdogfood/clear-round-datasets/gh-pages/items
+const UPSTREAM_BASE = process.env.UPSTREAM_BASE; // e.g. https://raw.githubusercontent.com/sportdogfood/clear-round-datasets/main/items
 if (!UPSTREAM_BASE) throw new Error("Missing UPSTREAM_BASE");
 
 const ALLOW_DIRS = new Set(
@@ -22,31 +22,47 @@ const CACHE_TTL = parseInt(process.env.CACHE_TTL || "300", 10);
 // --- Tiny in-memory cache ---
 const memoryCache = new Map(); // key => { body, etag, lastModified, fetchedAt }
 
-// helpers
+// --- helpers
+const ALLOWED_FILE_EXT_RE = /\.(json|txt|md|html|js)$/i;
+
 function isAllowedPath(rel) {
   if (!rel) return false;
   if (rel.includes("..")) return false;
-  if (!/^[a-z0-9\-_/]+\.json$/i.test(rel)) return false;
+  // basic shape: dir/dir/file.ext
+  if (!/^[a-z0-9\-_/]+\.[a-z0-9]+$/i.test(rel)) return false;
+  // extension must be allowed for GETs
+  if (!ALLOWED_FILE_EXT_RE.test(rel)) return false;
   const top = rel.split("/")[0];
   return ALLOW_DIRS.has(top);
 }
+
 function upstreamUrl(rel) {
   return `${UPSTREAM_BASE}/${rel}`
     .replace(/(?<!:)\/{2,}/g, "/")
     .replace("https:/", "https://");
 }
 
+function contentTypeFor(rel) {
+  const ext = rel.toLowerCase().slice(rel.lastIndexOf("."));
+  switch (ext) {
+    case ".json": return "application/json";
+    case ".txt":  return "text/plain; charset=utf-8";
+    case ".md":   return "text/markdown; charset=utf-8";
+    case ".html": return "text/html; charset=utf-8";
+    case ".js":   return "application/javascript; charset=utf-8";
+    default:      return "application/octet-stream";
+  }
+}
+
 // middleware
 app.use(morgan("combined"));
-app.use(cors({ origin: "*"}));
+app.use(cors({ origin: "*" }));
 app.use(express.json());
 
 // health
 app.get("/health", (_req, res) => {
   res.json({ ok: true, uptime: process.uptime() });
 });
-
-
 
 // -------- Global manifest of items/ --------
 const RAW_RE = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/;
@@ -55,25 +71,26 @@ let GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH;
 
 // Always log what we got for UPSTREAM_BASE
 console.log(`[startup] UPSTREAM_BASE='${UPSTREAM_BASE}'`);
-console.log(`[startup] ALLOW_DIRS=${Array.from(ALLOW_DIRS).join(',')}`);
+console.log(`[startup] ALLOW_DIRS=${Array.from(ALLOW_DIRS).join(",")}`);
 
 if (m) {
   [, GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH] = m;
   console.log(`[manifest] enabled for ${GH_OWNER}/${GH_REPO}@${GH_BRANCH} base='${GH_BASEPATH}'`);
 } else {
-  console.warn('[manifest] disabled: UPSTREAM_BASE is not raw.githubusercontent.com');
+  console.warn("[manifest] disabled: UPSTREAM_BASE is not raw.githubusercontent.com");
 }
+
 // List JSON files in a directory via GitHub API (cached for 24h)
 async function listDir(dir) {
-  if (!GH_OWNER) throw new Error('Manifest unavailable (UPSTREAM_BASE not raw.github...)');
+  if (!GH_OWNER) throw new Error("Manifest unavailable (UPSTREAM_BASE not raw.github...)");
   const key = `__index__/${dir}`;
   const now = Date.now();
   const cached = memoryCache.get(key);
   const TTL_MS = 24 * 60 * 60 * 1000;
-  if (cached && (now - cached.fetchedAt) < TTL_MS) return cached.body;
+  if (cached && now - cached.fetchedAt < TTL_MS) return cached.body;
 
   const api = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_BASEPATH}/${dir}?ref=${encodeURIComponent(GH_BRANCH)}`;
-  const headers = { 'Accept': 'application/vnd.github+json', 'User-Agent': 'crt-items-proxy' };
+  const headers = { Accept: "application/vnd.github+json", "User-Agent": "crt-items-proxy" };
   if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
 
   const r = await fetch(api, { headers });
@@ -82,8 +99,8 @@ async function listDir(dir) {
 
   const files = Array.isArray(json)
     ? json
-        .filter(x => x.type === 'file' && /\.json$/i.test(x.name))
-        .map(x => x.name.replace(/\.json$/i, ''))
+        .filter(x => x.type === "file" && /\.json$/i.test(x.name)) // manifest lists JSON files only
+        .map(x => x.name.replace(/\.json$/i, ""))
         .sort()
     : [];
 
@@ -92,9 +109,9 @@ async function listDir(dir) {
   return body;
 }
 
-app.get(['/manifest.json', '/items/manifest.json'], async (_req, res) => {
+app.get(["/manifest.json", "/items/manifest.json"], async (_req, res) => {
   try {
-    if (!GH_OWNER) return res.status(501).json({ error: 'Manifest disabled for non-raw UPSTREAM_BASE' });
+    if (!GH_OWNER) return res.status(501).json({ error: "Manifest disabled for non-raw UPSTREAM_BASE" });
 
     const entries = await Promise.all(
       Array.from(ALLOW_DIRS).map(async dir => {
@@ -113,12 +130,12 @@ app.get(['/manifest.json', '/items/manifest.json'], async (_req, res) => {
       dirs: Object.fromEntries(entries)
     });
   } catch (e) {
-    console.error('Manifest error:', e);
-    res.status(500).json({ error: 'Manifest failed' });
+    console.error("Manifest error:", e);
+    res.status(500).json({ error: "Manifest failed" });
   }
 });
 
-// proxy: /items/<dir>/<file>.json
+// proxy: /items/<dir>/<file>.<ext>   (GET supports .json, .txt, .md, .html, .js)
 app.get("/items/*", async (req, res) => {
   try {
     const rel = (req.params[0] || "").trim();
@@ -127,14 +144,15 @@ app.get("/items/*", async (req, res) => {
     const cacheKey = rel;
     const now = Date.now();
     const cached = memoryCache.get(cacheKey);
-    const isFresh = cached && (now - cached.fetchedAt) < CACHE_TTL * 1000;
+    const isFresh = cached && now - cached.fetchedAt < CACHE_TTL * 1000;
+    const ctype = contentTypeFor(rel);
 
     const headers = {};
     if (cached?.etag) headers["If-None-Match"] = cached.etag;
     if (cached?.lastModified) headers["If-Modified-Since"] = cached.lastModified;
 
     if (isFresh) {
-      res.set("Content-Type", "application/json");
+      res.set("Content-Type", ctype);
       if (cached.etag) res.set("ETag", cached.etag);
       if (cached.lastModified) res.set("Last-Modified", cached.lastModified);
       return res.status(200).send(cached.body);
@@ -145,7 +163,7 @@ app.get("/items/*", async (req, res) => {
 
     if (resp.status === 304 && cached) {
       cached.fetchedAt = now;
-      res.set("Content-Type", "application/json");
+      res.set("Content-Type", ctype);
       if (cached.etag) res.set("ETag", cached.etag);
       if (cached.lastModified) res.set("Last-Modified", cached.lastModified);
       return res.status(200).send(cached.body);
@@ -159,14 +177,9 @@ app.get("/items/*", async (req, res) => {
     const etag = resp.headers.get("etag") || "";
     const lastModified = resp.headers.get("last-modified") || "";
 
-    memoryCache.set(cacheKey, {
-      body: text,
-      etag,
-      lastModified,
-      fetchedAt: now
-    });
+    memoryCache.set(cacheKey, { body: text, etag, lastModified, fetchedAt: now });
 
-    res.set("Content-Type", "application/json");
+    res.set("Content-Type", ctype);
     if (etag) res.set("ETag", etag);
     if (lastModified) res.set("Last-Modified", lastModified);
     return res.status(200).send(text);
@@ -175,30 +188,34 @@ app.get("/items/*", async (req, res) => {
     res.status(500).json({ error: "Proxy failed" });
   }
 });
-// --- Minimal GitHub commit endpoint (with path normalization) ---
-app.post('/items/commit', async (req, res) => {
+
+// --- Minimal GitHub commit endpoint (JSON-only writes, with path normalization) ---
+app.post("/items/commit", async (req, res) => {
   try {
     let { path, json, message } = req.body;
-    if (!path || !json) return res.status(400).json({ error: 'path and json required' });
+    if (!path || !json) return res.status(400).json({ error: "path and json required" });
 
     // Accept either "airports/lex.json" or "items/airports/lex.json"
-    let rel = String(path).replace(/^\/+/, '').replace(/^items\//, '');
+    let rel = String(path).replace(/^\/+/, "").replace(/^items\//, "");
 
-    // Validate against allowed dirs & *.json
-    if (!isAllowedPath(rel)) return res.status(400).json({ error: 'Path not allowed' });
+    // Commit remains JSON-only for safety
+    if (!/\.json$/i.test(rel)) return res.status(400).json({ error: "Only .json commits are allowed" });
 
-    const repo = process.env.GITHUB_REPO;      // e.g. "sportdogfood/clear-round-datasets"
-    const branch = process.env.GITHUB_BRANCH || 'main'; // set to "gh-pages" if that's what you serve
+    // Validate against allowed dirs & file pattern
+    if (!isAllowedPath(rel)) return res.status(400).json({ error: "Path not allowed" });
+
+    const repo = process.env.GITHUB_REPO; // e.g. "sportdogfood/clear-round-datasets"
+    const branch = process.env.GITHUB_BRANCH || "main"; // set to "gh-pages" if that's what you serve
     const token = process.env.GITHUB_TOKEN;
-    if (!repo || !token) return res.status(500).json({ error: 'Missing GITHUB_REPO or GITHUB_TOKEN' });
+    if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
     // Commit to items/<rel> inside the repo
     const repoPath = `items/${rel}`;
     const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
     const headers = {
-      'Authorization': `Bearer ${token}`,
-      'Accept': 'application/vnd.github+json',
-      'User-Agent': 'crt-items-proxy'
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "crt-items-proxy"
     };
 
     // Look up existing SHA (if file already exists)
@@ -209,11 +226,11 @@ app.post('/items/commit', async (req, res) => {
       sha = meta.sha;
     }
 
-    const content = Buffer.from(JSON.stringify(json, null, 2)).toString('base64');
+    const content = Buffer.from(JSON.stringify(json, null, 2)).toString("base64");
     const body = { message: message || `chore: update ${repoPath}`, content, branch };
     if (sha) body.sha = sha;
 
-    const put = await fetch(api, { method: 'PUT', headers, body: JSON.stringify(body) });
+    const put = await fetch(api, { method: "PUT", headers, body: JSON.stringify(body) });
     const result = await put.json();
     if (!put.ok) return res.status(put.status).json(result);
 
@@ -227,9 +244,10 @@ app.post('/items/commit', async (req, res) => {
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: 'Commit failed' });
+    res.status(500).json({ error: "Commit failed" });
   }
 });
+
 // boot
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
