@@ -193,26 +193,53 @@ app.get("/items/*", async (req, res) => {
 });
 
 // --- Minimal GitHub commit endpoint (JSON-only writes, with path normalization) ---
+// --- GitHub commit endpoint (supports .json + text files) ---
 app.post("/items/commit", async (req, res) => {
   try {
     let { path, json, message } = req.body;
-    if (!path || !json) return res.status(400).json({ error: "path and json required" });
+    if (!path || json === undefined || json === null) {
+      return res.status(400).json({ error: "path and json required" });
+    }
 
-    // Accept either "airports/lex.json" or "items/airports/lex.json"
+    // Normalize path: accept "items/..." or bare "...", strip leading slashes
     let rel = String(path).replace(/^\/+/, "").replace(/^items\//, "");
 
-    // Commit remains JSON-only for safety
-    if (!/\.json$/i.test(rel)) return res.status(400).json({ error: "Only .json commits are allowed" });
-
-    // Validate against allowed dirs & file pattern
+    // Validate target path (dir+ext must be allowed)
     if (!isAllowedPath(rel)) return res.status(400).json({ error: "Path not allowed" });
 
-    const repo = process.env.GITHUB_REPO; // e.g. "sportdogfood/clear-round-datasets"
-    const branch = process.env.GITHUB_BRANCH || "main"; // set to "gh-pages" if that's what you serve
-    const token = process.env.GITHUB_TOKEN;
-    if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
+    const isJson = /\.json$/i.test(rel);
+    // For non-.json files, require the client to send a string (the file body)
+    if (!isJson && typeof json !== "string") {
+      return res.status(400).json({ error: "For text files, json must be a string body" });
+    }
 
-    // Commit to items/<rel> inside the repo
+    const repo = process.env.GITHUB_REPO;             // e.g. "sportdogfood/clear-round-datasets"
+    const branch = process.env.GITHUB_BRANCH || "main";
+    const token = process.env.GITHUB_TOKEN;
+    if (!repo || !token) {
+      return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
+    }
+
+    // Compute content string based on extension
+    let contentStr;
+    if (isJson) {
+      try {
+        // If client provided a string, parse it first so we pretty-print consistently
+        contentStr = JSON.stringify(
+          typeof json === "string" ? JSON.parse(json) : json,
+          null,
+          2
+        ) + "\n";
+      } catch (e) {
+        return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` });
+      }
+    } else {
+      // Normalize text files for clean diffs: LF newlines, ensure trailing newline
+      contentStr = String(json).replace(/\r\n?/g, "\n");
+      if (!contentStr.endsWith("\n")) contentStr += "\n";
+    }
+
+    // Prepare GitHub API call
     const repoPath = `items/${rel}`;
     const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
     const headers = {
@@ -221,7 +248,7 @@ app.post("/items/commit", async (req, res) => {
       "User-Agent": "crt-items-proxy"
     };
 
-    // Look up existing SHA (if file already exists)
+    // Fetch existing SHA (if any)
     let sha;
     const head = await fetch(`${api}?ref=${encodeURIComponent(branch)}`, { headers });
     if (head.ok) {
@@ -229,15 +256,18 @@ app.post("/items/commit", async (req, res) => {
       sha = meta.sha;
     }
 
-    const content = Buffer.from(JSON.stringify(json, null, 2)).toString("base64");
-    const body = { message: message || `chore: update ${repoPath}`, content, branch };
+    const body = {
+      message: message || `chore: update ${repoPath}`,
+      content: Buffer.from(contentStr, "utf8").toString("base64"),
+      branch
+    };
     if (sha) body.sha = sha;
 
     const put = await fetch(api, { method: "PUT", headers, body: JSON.stringify(body) });
     const result = await put.json();
     if (!put.ok) return res.status(put.status).json(result);
 
-    // Bust proxy cache (cache key uses rel)
+    // Bust proxy cache (GET path key)
     memoryCache.delete(rel);
 
     res.json({
