@@ -42,10 +42,12 @@ function upstreamUrl(rel) {
     .replace("https:/", "https://");
 }
 
+// IMPORTANT: Serve JSON GETs as text so renderers (like mine) reliably display it.
+// Writes remain JSON (unchanged).
 function contentTypeFor(rel) {
   const ext = rel.toLowerCase().slice(rel.lastIndexOf("."));
   switch (ext) {
-    case ".json": return "application/json";
+    case ".json": return "text/plain; charset=utf-8";
     case ".txt":  return "text/plain; charset=utf-8";
     case ".md":   return "text/markdown; charset=utf-8";
     case ".html": return "text/html; charset=utf-8";
@@ -113,7 +115,11 @@ async function listDir(dir) {
 // New endpoints: /_manifest.json and /items/_manifest.json
 app.get(["/_manifest.json", "/items/_manifest.json"], async (_req, res) => {
   try {
-    if (!GH_OWNER) return res.status(501).json({ error: "Manifest disabled for non-raw UPSTREAM_BASE" });
+    if (!GH_OWNER) {
+      res.status(501);
+      res.set("Content-Type", "text/plain; charset=utf-8");
+      return res.send(JSON.stringify({ error: "Manifest disabled for non-raw UPSTREAM_BASE" }, null, 2) + "\n");
+    }
 
     const entries = await Promise.all(
       Array.from(ALLOW_DIRS).map(async dir => {
@@ -126,15 +132,21 @@ app.get(["/_manifest.json", "/items/_manifest.json"], async (_req, res) => {
       })
     );
 
-    res.set("X-CRT-Manifest", "generated");
-    res.json({
+    const payload = {
       generated_at: new Date().toISOString(),
       upstream: { owner: GH_OWNER, repo: GH_REPO, branch: GH_BRANCH, basepath: GH_BASEPATH },
       dirs: Object.fromEntries(entries)
-    });
+    };
+
+    // Serve as text for reliable rendering
+    res.set("X-CRT-Manifest", "generated");
+    res.set("Content-Type", "text/plain; charset=utf-8");
+    return res.status(200).send(JSON.stringify(payload, null, 2) + "\n");
   } catch (e) {
     console.error("Manifest error:", e);
-    res.status(500).json({ error: "Manifest failed" });
+    res.status(500);
+    res.set("Content-Type", "text/plain; charset=utf-8");
+    return res.send(JSON.stringify({ error: "Manifest failed" }, null, 2) + "\n");
   }
 });
 
@@ -192,7 +204,6 @@ app.get("/items/*", async (req, res) => {
   }
 });
 
-// --- Minimal GitHub commit endpoint (JSON-only writes, with path normalization) ---
 // --- GitHub commit endpoint (supports .json + text files) ---
 app.post("/items/commit", async (req, res) => {
   try {
