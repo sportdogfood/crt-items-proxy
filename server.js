@@ -42,11 +42,10 @@ function upstreamUrl(rel) {
     .replace("https:/", "https://");
 }
 
-// IMPORTANT: Serve JSON GETs as text so renderers (like mine) reliably display it.
-// Writes remain JSON (unchanged).
 function contentTypeFor(rel) {
   const ext = rel.toLowerCase().slice(rel.lastIndexOf("."));
   switch (ext) {
+    // Serve JSON as text for reliable rendering in clients like mine.
     case ".json": return "text/plain; charset=utf-8";
     case ".txt":  return "text/plain; charset=utf-8";
     case ".md":   return "text/markdown; charset=utf-8";
@@ -138,7 +137,6 @@ app.get(["/_manifest.json", "/items/_manifest.json"], async (_req, res) => {
       dirs: Object.fromEntries(entries)
     };
 
-    // Serve as text for reliable rendering
     res.set("X-CRT-Manifest", "generated");
     res.set("Content-Type", "text/plain; charset=utf-8");
     return res.status(200).send(JSON.stringify(payload, null, 2) + "\n");
@@ -147,6 +145,53 @@ app.get(["/_manifest.json", "/items/_manifest.json"], async (_req, res) => {
     res.status(500);
     res.set("Content-Type", "text/plain; charset=utf-8");
     return res.send(JSON.stringify({ error: "Manifest failed" }, null, 2) + "\n");
+  }
+});
+
+// ---------- TXT alias for any upstream file (read-only) ----------
+// Usage: /items/txt/<path>.txt  -> fetches upstream <path> without trailing .txt
+// Example: /items/txt/agents/manifest.json.txt  -> reads agents/manifest.json
+app.get("/items/txt/*", async (req, res) => {
+  try {
+    const rawPath = (req.params[0] || "").trim();
+    if (!rawPath.endsWith(".txt")) {
+      return res.status(400).json({ error: "Bad path" });
+    }
+    const stripped = rawPath.slice(0, -4); // remove trailing .txt
+    if (!isAllowedPath(stripped)) {
+      return res.status(400).json({ error: "Bad path" });
+    }
+
+    const cacheKey = `txt:${stripped}`;
+    const now = Date.now();
+    const cached = memoryCache.get(cacheKey);
+    const isFresh = cached && now - cached.fetchedAt < CACHE_TTL * 1000;
+
+    if (isFresh) {
+      res.set("Content-Type", "text/plain; charset=utf-8");
+      if (cached.etag) res.set("ETag", cached.etag);
+      if (cached.lastModified) res.set("Last-Modified", cached.lastModified);
+      return res.status(200).send(cached.body);
+    }
+
+    const url = upstreamUrl(stripped);
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      return res.status(resp.status).json({ error: `Upstream ${resp.status}` });
+    }
+    const text = await resp.text();
+    const etag = resp.headers.get("etag") || "";
+    const lastModified = resp.headers.get("last-modified") || "";
+
+    memoryCache.set(cacheKey, { body: text, etag, lastModified, fetchedAt: now });
+
+    res.set("Content-Type", "text/plain; charset=utf-8");
+    if (etag) res.set("ETag", etag);
+    if (lastModified) res.set("Last-Modified", lastModified);
+    return res.status(200).send(text);
+  } catch (err) {
+    console.error("TXT alias error:", err);
+    res.status(500).json({ error: "Proxy failed" });
   }
 });
 
@@ -179,8 +224,8 @@ app.get("/items/*", async (req, res) => {
     if (resp.status === 304 && cached) {
       cached.fetchedAt = now;
       res.set("Content-Type", ctype);
-      if (cached.etag) res.set("ETag", cached.etag);
-      if (cached.lastModified) res.set("Last-Modified", cached.lastModified);
+      if (cached.etag) res.set("ETag", etag);
+      if (cached.lastModified) res.set("Last-Modified", lastModified);
       return res.status(200).send(cached.body);
     }
 
