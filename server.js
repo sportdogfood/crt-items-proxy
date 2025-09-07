@@ -28,8 +28,8 @@ const ALLOWED_FILE_EXT_RE = /\.(json|txt|md|html|js)$/i;
 function isAllowedPath(rel) {
   if (!rel) return false;
   if (rel.includes("..")) return false;
-  // basic shape: dir/dir/file.ext
-  if (!/^[a-z0-9\-_/]+\.[a-z0-9]+$/i.test(rel)) return false;
+  // basic shape: dir/dir/file.ext (allow dots in basename)
+  if (!/^[a-z0-9][a-z0-9\-_.\/]*\.[a-z0-9]+$/i.test(rel)) return false;
   // extension must be allowed for GETs
   if (!ALLOWED_FILE_EXT_RE.test(rel)) return false;
   const top = rel.split("/")[0];
@@ -53,6 +53,34 @@ function contentTypeFor(rel) {
     case ".js":   return "application/javascript; charset=utf-8";
     default:      return "application/octet-stream";
   }
+}
+
+// Minimal fetch with timeout + single retry for robustness
+async function fetchWithRetry(url, options = {}, { attempts = 2, timeoutMs = 5000 } = {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timer);
+      // Retry on 5xx; pass through others
+      if (resp.status >= 500 && resp.status <= 599 && i + 1 < attempts) {
+        await new Promise(r => setTimeout(r, 400 * (i + 1)));
+        continue;
+      }
+      return resp;
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      if (i + 1 < attempts) {
+        await new Promise(r => setTimeout(r, 400 * (i + 1)));
+        continue;
+      }
+      throw lastErr;
+    }
+  }
+  throw lastErr;
 }
 
 // middleware
@@ -94,7 +122,7 @@ async function listDir(dir) {
   const headers = { Accept: "application/vnd.github+json", "User-Agent": "crt-items-proxy" };
   if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
 
-  const r = await fetch(api, { headers });
+  const r = await fetchWithRetry(api, { headers }, { attempts: 2, timeoutMs: 5000 });
   if (!r.ok) throw new Error(`GitHub list error ${r.status}: ${await r.text()}`);
   const json = await r.json();
 
@@ -169,13 +197,14 @@ app.get("/items/txt/*", async (req, res) => {
 
     if (isFresh) {
       res.set("Content-Type", "text/plain; charset=utf-8");
+      res.set("Cache-Control", `public, max-age=${Math.min(CACHE_TTL, 60)}`);
       if (cached.etag) res.set("ETag", cached.etag);
       if (cached.lastModified) res.set("Last-Modified", cached.lastModified);
       return res.status(200).send(cached.body);
     }
 
     const url = upstreamUrl(stripped);
-    const resp = await fetch(url);
+    const resp = await fetchWithRetry(url, {}, { attempts: 2, timeoutMs: 5000 });
     if (!resp.ok) {
       return res.status(resp.status).json({ error: `Upstream ${resp.status}` });
     }
@@ -186,6 +215,7 @@ app.get("/items/txt/*", async (req, res) => {
     memoryCache.set(cacheKey, { body: text, etag, lastModified, fetchedAt: now });
 
     res.set("Content-Type", "text/plain; charset=utf-8");
+    res.set("Cache-Control", `public, max-age=${Math.min(CACHE_TTL, 60)}`);
     if (etag) res.set("ETag", etag);
     if (lastModified) res.set("Last-Modified", lastModified);
     return res.status(200).send(text);
@@ -213,19 +243,21 @@ app.get("/items/*", async (req, res) => {
 
     if (isFresh) {
       res.set("Content-Type", ctype);
+      res.set("Cache-Control", `public, max-age=${Math.min(CACHE_TTL, 60)}`);
       if (cached.etag) res.set("ETag", cached.etag);
       if (cached.lastModified) res.set("Last-Modified", cached.lastModified);
       return res.status(200).send(cached.body);
     }
 
     const url = upstreamUrl(rel);
-    const resp = await fetch(url, { headers });
+    const resp = await fetchWithRetry(url, { headers }, { attempts: 2, timeoutMs: 5000 });
 
     if (resp.status === 304 && cached) {
       cached.fetchedAt = now;
       res.set("Content-Type", ctype);
-      if (cached.etag) res.set("ETag", etag);
-      if (cached.lastModified) res.set("Last-Modified", lastModified);
+      res.set("Cache-Control", `public, max-age=${Math.min(CACHE_TTL, 60)}`);
+      if (cached.etag) res.set("ETag", cached.etag);
+      if (cached.lastModified) res.set("Last-Modified", cached.lastModified);
       return res.status(200).send(cached.body);
     }
 
@@ -240,6 +272,7 @@ app.get("/items/*", async (req, res) => {
     memoryCache.set(cacheKey, { body: text, etag, lastModified, fetchedAt: now });
 
     res.set("Content-Type", ctype);
+    res.set("Cache-Control", `public, max-age=${Math.min(CACHE_TTL, 60)}`);
     if (etag) res.set("ETag", etag);
     if (lastModified) res.set("Last-Modified", lastModified);
     return res.status(200).send(text);
@@ -306,7 +339,7 @@ app.post("/items/commit", async (req, res) => {
 
     // Fetch existing SHA (if any)
     let sha;
-    const head = await fetch(`${api}?ref=${encodeURIComponent(branch)}`, { headers });
+    const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
     if (head.ok) {
       const meta = await head.json();
       sha = meta.sha;
@@ -319,7 +352,7 @@ app.post("/items/commit", async (req, res) => {
     };
     if (sha) body.sha = sha;
 
-    const put = await fetch(api, { method: "PUT", headers, body: JSON.stringify(body) });
+    const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
     const result = await put.json();
     if (!put.ok) return res.status(put.status).json(result);
 
