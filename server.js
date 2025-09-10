@@ -1,3 +1,5 @@
+// server.js — full drop with /stash support (CSV/NDJSON enabled)
+
 const express = require("express");
 const fetch = require("node-fetch");
 const cors = require("cors");
@@ -19,11 +21,15 @@ const ALLOW_DIRS = new Set(
 );
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "300", 10);
 
+// Optional: where to stash batch artifacts (under items/)
+const STASH_PREFIX = process.env.STASH_PREFIX || "items/stash";
+
 // --- Tiny in-memory cache ---
 const memoryCache = new Map(); // key => { body, etag, lastModified, fetchedAt }
 
 // --- helpers
-const ALLOWED_FILE_EXT_RE = /\.(json|txt|md|html|js)$/i;
+// Allow csv/ndjson alongside json/txt/etc
+const ALLOWED_FILE_EXT_RE = /\.(json|txt|md|html|js|csv|ndjson)$/i;
 
 function isAllowedPath(rel) {
   if (!rel) return false;
@@ -46,12 +52,14 @@ function contentTypeFor(rel) {
   const ext = rel.toLowerCase().slice(rel.lastIndexOf("."));
   switch (ext) {
     // Serve JSON as text for reliable rendering in clients like mine.
-    case ".json": return "text/plain; charset=utf-8";
-    case ".txt":  return "text/plain; charset=utf-8";
-    case ".md":   return "text/markdown; charset=utf-8";
-    case ".html": return "text/html; charset=utf-8";
-    case ".js":   return "application/javascript; charset=utf-8";
-    default:      return "application/octet-stream";
+    case ".json":   return "text/plain; charset=utf-8";
+    case ".txt":    return "text/plain; charset=utf-8";
+    case ".md":     return "text/markdown; charset=utf-8";
+    case ".html":   return "text/html; charset=utf-8";
+    case ".js":     return "application/javascript; charset=utf-8";
+    case ".csv":    return "text/csv; charset=utf-8";
+    case ".ndjson": return "application/x-ndjson; charset=utf-8";
+    default:        return "application/octet-stream";
   }
 }
 
@@ -81,6 +89,82 @@ async function fetchWithRetry(url, options = {}, { attempts = 2, timeoutMs = 500
     }
   }
   throw lastErr;
+}
+
+// --- simple filename/path segment sanitizers for stash ---
+function safeSeg(s, allowDots = false) {
+  const re = allowDots ? /^[a-z0-9._-]+$/i : /^[a-z0-9_-]+$/i;
+  return typeof s === "string" && re.test(s) ? s : null;
+}
+
+function joinStashPath(folder, base, name) {
+  const f = safeSeg(folder) || "misc";
+  const b = safeSeg(base) || new Date().toISOString().replace(/[:.]/g, "").slice(0, 15);
+  const n = safeSeg(name, /*allowDots*/ true);
+  if (!n) return null;
+  // ensure we always live under items/
+  const rel = `${STASH_PREFIX}/${f}/${b}/${n}`.replace(/^items\//, "items/");
+  return rel;
+}
+
+async function commitText(rel, bodyText, message) {
+  // reuse commit logic to push text-like files to GitHub
+  const repo = process.env.GITHUB_REPO;             // e.g. "sportdogfood/clear-round-datasets"
+  const branch = process.env.GITHUB_BRANCH || "main";
+  const token = process.env.GITHUB_TOKEN;
+  if (!repo || !token) {
+    const e = new Error("Missing GITHUB_REPO or GITHUB_TOKEN");
+    e.code = 500;
+    throw e;
+  }
+
+  if (!isAllowedPath(rel)) {
+    const e = new Error("Path not allowed");
+    e.code = 400;
+    throw e;
+  }
+
+  const repoPath = `items/${String(rel).replace(/^items\//, "")}`;
+  const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "User-Agent": "crt-items-proxy"
+  };
+
+  // Fetch existing SHA (if any)
+  let sha;
+  const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
+  if (head.ok) {
+    const meta = await head.json();
+    sha = meta.sha;
+  }
+
+  // Normalize newlines for text; keep as-is otherwise
+  const contentStr = String(bodyText).replace(/\r\n?/g, "\n");
+  const body = {
+    message: message || `stash: ${repoPath}`,
+    content: Buffer.from(contentStr, "utf8").toString("base64"),
+    branch
+  };
+  if (sha) body.sha = sha;
+
+  const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
+  const result = await put.json();
+  if (!put.ok) {
+    const e = new Error(result.message || "GitHub put failed");
+    e.code = put.status;
+    e.details = result;
+    throw e;
+  }
+
+  // Bust proxy cache (GET path key)
+  memoryCache.delete(rel);
+
+  return {
+    path: repoPath,
+    commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url }
+  };
 }
 
 // middleware
@@ -225,7 +309,7 @@ app.get("/items/txt/*", async (req, res) => {
   }
 });
 
-// proxy: /items/<dir>/<file>.<ext>   (GET supports .json, .txt, .md, .html, .js)
+// proxy: /items/<dir>/<file>.<ext>   (GET supports .json, .txt, .md, .html, .js, .csv, .ndjson)
 app.get("/items/*", async (req, res) => {
   try {
     const rel = (req.params[0] || "").trim();
@@ -367,6 +451,50 @@ app.post("/items/commit", async (req, res) => {
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Commit failed" });
+  }
+});
+
+// ----------------- STASH: accept batch artifacts and persist to GitHub -----------------
+app.post("/stash", express.json({ limit: "5mb" }), async (req, res) => {
+  try {
+    const { folder, filename_base, files } = req.body || {};
+    if (!Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ error: "files[] required" });
+    }
+
+    const f = safeSeg(folder) || "misc";
+    const b = safeSeg(filename_base) || new Date().toISOString().replace(/[:.]/g, "").slice(0, 15);
+
+    const out = [];
+    for (const file of files) {
+      if (!file || !file.name || file.body === undefined) {
+        return res.status(400).json({ error: "each file requires name and body" });
+      }
+      const rel = joinStashPath(f, b, file.name);
+      if (!rel) return res.status(400).json({ error: `bad file name: ${file.name}` });
+
+      // enforce allowed extensions
+      if (!ALLOWED_FILE_EXT_RE.test(rel)) {
+        return res.status(400).json({ error: `extension not allowed for ${file.name}` });
+      }
+
+      const message = `stash(${f}/${b}): ${file.name}`;
+      const result = await commitText(rel, String(file.body), message);
+      const publicUrl = `${req.protocol}://${req.get("host")}/items/${rel.replace(/^items\//, "")}`;
+
+      out.push({
+        name: file.name,
+        path: rel,
+        url: publicUrl,
+        commit: result.commit
+      });
+    }
+
+    return res.json({ ok: true, folder: f, filename_base: b, files: out });
+  } catch (err) {
+    console.error("stash error:", err);
+    const code = err.code && Number.isInteger(err.code) ? err.code : 500;
+    return res.status(code).json({ error: "stash failed", details: err.message || String(err) });
   }
 });
 
