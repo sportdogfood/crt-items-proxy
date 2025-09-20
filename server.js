@@ -497,7 +497,23 @@ app.post("/stash", express.json({ limit: "5mb" }), async (req, res) => {
     return res.status(code).json({ error: "stash failed", details: err.message || String(err) });
   }
 });
+// NEW ROUTE: serve essentials / hub-data
+app.get('/items/agents/hub-data/:file', (req, res) => {
+  try {
+    const fileName = req.params.file;
+    const filePath = path.join(__dirname, 'items/agents/hub-data', fileName);
 
+    if (fs.existsSync(filePath)) {
+      res.setHeader('Content-Type', 'application/json');
+      res.sendFile(filePath);
+    } else {
+      res.status(404).json({ error: 'Not found' });
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 // boot
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
