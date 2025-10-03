@@ -1,4 +1,200 @@
+// server.js — header and helpers (no routes)
 
+// Core imports
+const express = require("express");
+const fetch = require("node-fetch");
+const cors = require("cors");
+const morgan = require("morgan");
+const path = require("path");
+const fs = require("fs");
+require("dotenv").config();
+
+// App
+const app = express();
+
+// --- Config via env ---
+const UPSTREAM_BASE = process.env.UPSTREAM_BASE; // e.g. https://raw.githubusercontent.com/sportdogfood/clear-round-datasets/main/items
+if (!UPSTREAM_BASE) throw new Error("Missing UPSTREAM_BASE");
+
+const ALLOW_DIRS = new Set(
+  (process.env.ALLOW_DIRS || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
+const CACHE_TTL = parseInt(process.env.CACHE_TTL || "300", 10);
+const STASH_PREFIX = process.env.STASH_PREFIX || "items/stash";
+const GITHUB_REPO   = process.env.GITHUB_REPO;      // e.g. sportdogfood/clear-round-datasets
+const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
+const GITHUB_TOKEN  = process.env.GITHUB_TOKEN || "";
+
+// --- Tiny in-memory cache ---
+const memoryCache = new Map(); // key => { body, etag, lastModified, fetchedAt }
+
+// --- helpers ---
+const ALLOWED_FILE_EXT_RE = /\.(json|txt|md|html|js|csv|ndjson)$/i;
+
+function isAllowedPath(rel) {
+  if (!rel) return false;
+  if (rel.includes("..")) return false;
+  if (!/^[a-z0-9][a-z0-9\-_.\/]*\.[a-z0-9]+$/i.test(rel)) return false;
+  if (!ALLOWED_FILE_EXT_RE.test(rel)) return false;
+  const top = rel.split("/")[0];
+  return ALLOW_DIRS.has(top);
+}
+
+function upstreamUrl(rel) {
+  return `${UPSTREAM_BASE}/${rel}`
+    .replace(/(?<!:)\/{2,}/g, "/")
+    .replace("https:/", "https://");
+}
+
+function contentTypeFor(rel) {
+  const ext = rel.toLowerCase().slice(rel.lastIndexOf("."));
+  switch (ext) {
+    case ".json":   return "application/json; charset=utf-8";
+    case ".txt":    return "text/plain; charset=utf-8";
+    case ".md":     return "text/markdown; charset=utf-8";
+    case ".html":   return "text/html; charset=utf-8";
+    case ".js":     return "application/javascript; charset=utf-8";
+    case ".csv":    return "text/csv; charset=utf-8";
+    case ".ndjson": return "application/x-ndjson; charset=utf-8";
+    default:        return "application/octet-stream";
+  }
+}
+
+// Minimal fetch with timeout + single retry
+async function fetchWithRetry(url, options = {}, { attempts = 2, timeoutMs = 5000 } = {}) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const resp = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timer);
+      if (resp.status >= 500 && resp.status <= 599 && i + 1 < attempts) {
+        await new Promise(r => setTimeout(r, 400 * (i + 1)));
+        continue;
+      }
+      return resp;
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      if (i + 1 < attempts) {
+        await new Promise(r => setTimeout(r, 400 * (i + 1)));
+        continue;
+      }
+      throw lastErr;
+    }
+  }
+  throw lastErr;
+}
+
+// Safe path segments for /stash
+function safeSeg(s, allowDots = false) {
+  const re = allowDots ? /^[a-z0-9._-]+$/i : /^[a-z0-9_-]+$/i;
+  return typeof s === "string" && re.test(s) ? s : null;
+}
+
+function joinStashPath(folder, base, name) {
+  const f = safeSeg(folder) || "misc";
+  const b = safeSeg(base) || new Date().toISOString().replace(/[:.]/g, "").slice(0, 15);
+  const n = safeSeg(name, /*allowDots*/ true);
+  if (!n) return null;
+  return `${STASH_PREFIX}/${f}/${b}/${n}`.replace(/^items\//, "items/");
+}
+
+async function commitText(rel, bodyText, message) {
+  if (!GITHUB_REPO || !GITHUB_TOKEN) {
+    const e = new Error("Missing GITHUB_REPO or GITHUB_TOKEN");
+    e.code = 500;
+    throw e;
+  }
+  if (!isAllowedPath(rel)) {
+    const e = new Error("Path not allowed");
+    e.code = 400;
+    throw e;
+  }
+
+  const repoPath = `items/${String(rel).replace(/^items\//, "")}`;
+  const api = `https://api.github.com/repos/${GITHUB_REPO}/contents/${repoPath}`;
+  const headers = {
+    Authorization: `Bearer ${GITHUB_TOKEN}`,
+    Accept: "application/vnd.github+json",
+    "User-Agent": "crt-items-proxy"
+  };
+
+  // existing SHA
+  let sha;
+  const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(GITHUB_BRANCH)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
+  if (head.ok) {
+    const meta = await head.json();
+    sha = meta.sha;
+  }
+
+  const contentStr = String(bodyText).replace(/\r\n?/g, "\n");
+  const body = {
+    message: message || `stash: ${repoPath}`,
+    content: Buffer.from(contentStr, "utf8").toString("base64"),
+    branch: GITHUB_BRANCH
+  };
+  if (sha) body.sha = sha;
+
+  const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
+  const result = await put.json();
+  if (!put.ok) {
+    const e = new Error(result.message || "GitHub put failed");
+    e.code = put.status;
+    e.details = result;
+    throw e;
+  }
+
+  memoryCache.delete(rel);
+  return { path: repoPath, commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url } };
+}
+
+// Manifest helpers
+const RAW_RE = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/;
+const m = RAW_RE.exec(UPSTREAM_BASE);
+let GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH;
+
+console.log(`[startup] UPSTREAM_BASE='${UPSTREAM_BASE}'`);
+console.log(`[startup] ALLOW_DIRS=${Array.from(ALLOW_DIRS).join(",")}`);
+
+if (m) {
+  [, GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH] = m;
+  console.log(`[manifest] enabled for ${GH_OWNER}/${GH_REPO}@${GH_BRANCH} base='${GH_BASEPATH}'`);
+} else {
+  console.warn("[manifest] disabled: UPSTREAM_BASE is not raw.githubusercontent.com");
+}
+
+async function listDir(dir) {
+  if (!GH_OWNER) throw new Error("Manifest unavailable (UPSTREAM_BASE not raw.github...)");
+  const key = `__index__/${dir}`;
+  const now = Date.now();
+  const cached = memoryCache.get(key);
+  const TTL_MS = 24 * 60 * 60 * 1000;
+  if (cached && now - cached.fetchedAt < TTL_MS) return cached.body;
+
+  const api = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_BASEPATH}/${dir}?ref=${encodeURIComponent(GH_BRANCH)}`;
+  const headers = { Accept: "application/vnd.github+json", "User-Agent": "crt-items-proxy" };
+  if (GITHUB_TOKEN) headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
+
+  const r = await fetchWithRetry(api, { headers }, { attempts: 2, timeoutMs: 5000 });
+  if (!r.ok) throw new Error(`GitHub list error ${r.status}: ${await r.text()}`);
+  const json = await r.json();
+
+  const files = Array.isArray(json)
+    ? json.filter(x => x.type === "file" && /\.json$/i.test(x.name)).map(x => x.name.replace(/\.json$/i, "")).sort()
+    : [];
+
+  const body = { dir, count: files.length, files };
+  memoryCache.set(key, { body, fetchedAt: now });
+  return body;
+}
+
+// Common handler used by routes
 async function handleItems(req, res, { head = false } = {}) {
   const rel = (req.params[0] || "").trim();
   if (!isAllowedPath(rel)) return res.status(400).end(head ? "" : JSON.stringify({ error: "Bad path" }));
@@ -61,6 +257,14 @@ async function handleItems(req, res, { head = false } = {}) {
   }
 }
 
+// Middleware (keep before routes)
+app.use(morgan("combined"));
+app.use(cors({ origin: "*" }));
+app.use(express.json());
+
+// --- routes go below this line ---
+
+
 // --- HEAD then GET for /items/* ---
 app.head("/items/*", async (req, res) => {
   try { await handleItems(req, res, { head: true }); }
@@ -122,51 +326,7 @@ app.post("/items/commit", async (req, res) => {
   }
 });
 
-// --- STASH endpoint ---
-app.post("/stash", express.json({ limit: "5mb" }), async (req, res) => {
-  try {
-    const { folder, filename_base, files } = req.body || {};
-    if (!Array.isArray(files) || files.length === 0) return res.status(400).json({ error: "files[] required" });
 
-    const f = safeSeg(folder) || "misc";
-    const b = safeSeg(filename_base) || new Date().toISOString().replace(/[:.]/g, "").slice(0, 15);
-
-    const out = [];
-    for (const file of files) {
-      if (!file || !file.name || file.body === undefined) return res.status(400).json({ error: "each file requires name and body" });
-      const rel = joinStashPath(f, b, file.name);
-      if (!rel) return res.status(400).json({ error: `bad file name: ${file.name}` });
-      if (!ALLOWED_FILE_EXT_RE.test(rel)) return res.status(400).json({ error: `extension not allowed for ${file.name}` });
-
-      const result = await commitText(rel, String(file.body), `stash(${f}/${b}): ${file.name}`);
-      const publicUrl = `${req.protocol}://${req.get("host")}/items/${rel.replace(/^items\//, "")}`;
-      out.push({ name: file.name, path: rel, url: publicUrl, commit: result.commit });
-    }
-
-    return res.json({ ok: true, folder: f, filename_base: b, files: out });
-  } catch (err) {
-    console.error("stash error:", err);
-    const code = err.code && Number.isInteger(err.code) ? err.code : 500;
-    return res.status(code).json({ error: "stash failed", details: err.message || String(err) });
-  }
-});
-
-// Serve local hub-data if present
-app.get('/items/agents/hub-data/:file', (req, res) => {
-  try {
-    const fileName = req.params.file;
-    const filePath = path.join(__dirname, 'items/agents/hub-data', fileName);
-    if (fs.existsSync(filePath)) {
-      res.setHeader('Content-Type', 'application/json');
-      res.sendFile(filePath);
-    } else {
-      res.status(404).json({ error: 'Not found' });
-    }
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Server error' });
-  }
-});
 
 // boot
 const PORT = process.env.PORT || 3000;
