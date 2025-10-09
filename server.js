@@ -16,10 +16,26 @@ const app = express();
 const UPSTREAM_BASE = process.env.UPSTREAM_BASE; // e.g. https://raw.githubusercontent.com/sportdogfood/clear-round-datasets/main
 if (!UPSTREAM_BASE) throw new Error("Missing UPSTREAM_BASE");
 
+// Allowed top-level dirs for /items/*
 const ALLOW_DIRS = new Set(
-  (process.env.ALLOW_DIRS || "")
+  (process.env.ALLOW_DIRS || "items,items/runners,items/tasks,items/brand,items/venues,items/events,items/schema,items/gold,items/policy")
     .split(",")
     .map(s => s.trim())
+    .filter(Boolean)
+);
+
+// Domain allowlists
+const ALLOW_ORIGINS = new Set(
+  (process.env.ALLOW_ORIGINS || "https://items.clearroundtravel.com,https://blog.clearroundtravel.com")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
+const ALLOW_UPSTREAM_HOSTS = new Set(
+  (process.env.ALLOW_UPSTREAM_HOSTS || "raw.githubusercontent.com")
+    .split(",")
+    .map(s => s.trim().toLowerCase())
     .filter(Boolean)
 );
 
@@ -61,6 +77,18 @@ function contentTypeFor(rel) {
     case ".csv":    return "text/csv; charset=utf-8";
     case ".ndjson": return "application/x-ndjson; charset=utf-8";
     default:        return "application/octet-stream";
+  }
+}
+
+// Enforce upstream host allowlist
+function assertAllowedUpstream(urlStr) {
+  let host;
+  try { host = new URL(urlStr).host.toLowerCase(); }
+  catch { const e = new Error("Invalid upstream URL"); e.code = 400; throw e; }
+  if (!ALLOW_UPSTREAM_HOSTS.has(host)) {
+    const e = new Error(`Upstream host not allowed: ${host}`);
+    e.code = 400;
+    throw e;
   }
 }
 
@@ -161,6 +189,8 @@ let GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH;
 
 console.log(`[startup] UPSTREAM_BASE='${UPSTREAM_BASE}'`);
 console.log(`[startup] ALLOW_DIRS=${Array.from(ALLOW_DIRS).join(",")}`);
+console.log(`[startup] ALLOW_ORIGINS=${Array.from(ALLOW_ORIGINS).join(",")}`);
+console.log(`[startup] ALLOW_UPSTREAM_HOSTS=${Array.from(ALLOW_UPSTREAM_HOSTS).join(",")}`);
 
 if (m) {
   [, GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH] = m;
@@ -218,6 +248,8 @@ async function handleItems(req, res, { head = false } = {}) {
   }
 
   const url = upstreamUrl(rel);
+  try { assertAllowedUpstream(url); } catch (e) { return res.status(e.code || 400).json({ error: e.message }); }
+
   const upstreamMethod = head ? "HEAD" : "GET";
   const resp = await fetchWithRetry(url, { method: upstreamMethod, headers }, { attempts: 2, timeoutMs: 5000 });
 
@@ -259,7 +291,13 @@ async function handleItems(req, res, { head = false } = {}) {
 
 // Middleware (keep before routes)
 app.use(morgan("combined"));
-app.use(cors({ origin: "*" }));
+app.use(cors({
+  origin: function (origin, cb) {
+    if (!origin) return cb(null, true); // allow server-to-server and curl
+    const allowed = ALLOW_ORIGINS.has(origin);
+    return cb(allowed ? null : new Error("CORS blocked"), allowed);
+  }
+}));
 app.use(express.json());
 
 // --- HEAD then GET for /items/* ---
@@ -386,6 +424,8 @@ app.get("/docs/*", async (req, res) => {
     const repoPath = `docs/${clean}`;
 
     const upstream = `${UPSTREAM_BASE.replace(/\/+$/, "")}/${repoPath}`;
+    try { assertAllowedUpstream(upstream); } catch (e) { return res.status(e.code || 400).json({ error: e.message }); }
+
     const resp = await fetchWithRetry(upstream, { method: "GET" }, { attempts: 2, timeoutMs: 5000 });
     if (!resp.ok) {
       return res.status(resp.status).json({ error: `Upstream ${resp.status}`, path: repoPath });
@@ -402,7 +442,8 @@ app.get("/docs/*", async (req, res) => {
     return res.status(500).json({ error: e.message || String(e) });
   }
 });
-// --- /docs/commit-bulk (single Git commit for multiple docs/* files; accepts .html, .xml, .json) ---
+
+// --- /docs/commit-bulk (single Git commit for multiple docs/* files; accepts .html, .xml, .json)
 app.post("/docs/commit-bulk", async (req, res) => {
   try {
     const { message, overwrite, files } = req.body || {};
