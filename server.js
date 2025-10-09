@@ -247,7 +247,7 @@ async function handleItems(req, res, { head = false } = {}) {
     return head ? res.status(200).end() : res.status(200).send(cached.body);
   }
 
-  const url = upstreamUrl(rel);
+  const url = upstreamUrl(`items/${rel}`);
   try { assertAllowedUpstream(url); } catch (e) { return res.status(e.code || 400).json({ error: e.message }); }
 
   const upstreamMethod = head ? "HEAD" : "GET";
