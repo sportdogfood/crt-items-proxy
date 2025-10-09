@@ -290,15 +290,13 @@ async function handleItems(req, res, { head = false } = {}) {
 }
 
 // Middleware (keep before routes)
+// Middleware (keep before routes)
 app.use(morgan("combined"));
-app.use(cors({
-  origin: function (origin, cb) {
-    if (!origin) return cb(null, true); // allow server-to-server and curl
-    const allowed = ALLOW_ORIGINS.has(origin);
-    return cb(allowed ? null : new Error("CORS blocked"), allowed);
-  }
-}));
+app.use(cors({ origin: "*" }));
+app.options("*", cors()); // handle preflight
 app.use(express.json());
+
+
 
 // --- HEAD then GET for /items/* ---
 app.head("/items/*", async (req, res) => {
