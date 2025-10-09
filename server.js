@@ -13,7 +13,7 @@ require("dotenv").config();
 const app = express();
 
 // --- Config via env ---
-const UPSTREAM_BASE = process.env.UPSTREAM_BASE; // e.g. https://raw.githubusercontent.com/sportdogfood/clear-round-datasets/main/items
+const UPSTREAM_BASE = process.env.UPSTREAM_BASE; // e.g. https://raw.githubusercontent.com/sportdogfood/clear-round-datasets/main
 if (!UPSTREAM_BASE) throw new Error("Missing UPSTREAM_BASE");
 
 const ALLOW_DIRS = new Set(
@@ -23,7 +23,7 @@ const ALLOW_DIRS = new Set(
     .filter(Boolean)
 );
 
-const CACHE_TTL = parseInt(process.env.CACHE_TTL || "300", 10);
+const CACHE_TTL    = parseInt(process.env.CACHE_TTL || "300", 10);
 const STASH_PREFIX = process.env.STASH_PREFIX || "items/stash";
 const GITHUB_REPO   = process.env.GITHUB_REPO;      // e.g. sportdogfood/clear-round-datasets
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
@@ -117,8 +117,7 @@ async function commitText(rel, bodyText, message) {
     throw e;
   }
 
- // const repoPath = `items/${String(rel).replace(/^items\//, "")}`;
-  const repoPath = String(rel).replace(/^\/+/, ""); // ← changed
+  const repoPath = `items/${String(rel).replace(/^items\//, "")}`;
   const api = `https://api.github.com/repos/${GITHUB_REPO}/contents/${repoPath}`;
   const headers = {
     Authorization: `Bearer ${GITHUB_TOKEN}`,
@@ -263,9 +262,6 @@ app.use(morgan("combined"));
 app.use(cors({ origin: "*" }));
 app.use(express.json());
 
-// --- routes go below this line ---
-
-
 // --- HEAD then GET for /items/* ---
 app.head("/items/*", async (req, res) => {
   try { await handleItems(req, res, { head: true }); }
@@ -303,8 +299,7 @@ app.post("/items/commit", async (req, res) => {
     const token = process.env.GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
-    //const repoPath = `items/${rel}`;
-     const repoPath = rel; // ← changed
+    const repoPath = `items/${rel}`;
     const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
     const headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "crt-items-proxy" };
 
@@ -328,12 +323,88 @@ app.post("/items/commit", async (req, res) => {
   }
 });
 
+// --- /docs/commit (mirror of /items/commit but forces docs/ and JSON only)
+app.post("/docs/commit", async (req, res) => {
+  try {
+    let { path: p, json, message } = req.body || {};
+    if (!p || json === undefined || json === null) {
+      return res.status(400).json({ error: "path and json required" });
+    }
 
+    // normalize + enforce docs/
+    let rel = String(p).trim().replace(/^\/+/, "").replace(/^docs\//, "");
+    // For docs we enforce JSON files
+    if (!/\.json$/i.test(rel)) return res.status(400).json({ error: "Docs commits require a .json file path" });
+
+    // We do not rely on ALLOW_DIRS for docs; we force prefix to docs/
+    const repoPath = `docs/${rel}`;
+
+    // stringify JSON payload
+    let contentStr;
+    try {
+      contentStr = JSON.stringify(typeof json === "string" ? JSON.parse(json) : json, null, 2) + "\n";
+    } catch (e) {
+      return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` });
+    }
+
+    const repo   = process.env.GITHUB_REPO;
+    const branch = process.env.GITHUB_BRANCH || "main";
+    const token  = process.env.GITHUB_TOKEN;
+    if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
+
+    const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
+    const headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "crt-items-proxy" };
+
+    // existing SHA
+    let sha;
+    const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
+    if (head.ok) { const meta = await head.json(); sha = meta.sha; }
+
+    const body = { message: message || `chore: commit ${repoPath} via proxy`, content: Buffer.from(contentStr, "utf8").toString("base64"), branch };
+    if (sha) body.sha = sha;
+
+    const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
+    const result = await put.json();
+    if (!put.ok) return res.status(put.status).json(result);
+
+    // invalidate any cache for this rel if you keep one; keying with docs path
+    memoryCache.delete(`docs/${rel}`);
+
+    return res.status(200).json({ ok: true, path: repoPath, commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url } });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Docs commit failed" });
+  }
+});
+
+// GET /docs/* -> proxy-read from upstream repo (raw)
+app.get("/docs/*", async (req, res) => {
+  try {
+    // normalize and enforce docs/
+    const relParam = String(req.params[0] || "").trim().replace(/^\/+/, "");
+    const clean = relParam.replace(/^docs\//, "");
+    const repoPath = `docs/${clean}`;
+
+    const upstream = `${UPSTREAM_BASE.replace(/\/+$/, "")}/${repoPath}`;
+    const resp = await fetchWithRetry(upstream, { method: "GET" }, { attempts: 2, timeoutMs: 5000 });
+    if (!resp.ok) {
+      return res.status(resp.status).json({ error: `Upstream ${resp.status}`, path: repoPath });
+    }
+
+    const isJson = /\.json($|\?)/i.test(repoPath);
+    res.set("Cache-Control", `public, max-age=${Number(CACHE_TTL) || 0}`);
+    res.type(isJson ? "application/json; charset=utf-8" : "text/plain; charset=utf-8");
+
+    const body = await resp.text();
+    return res.status(200).send(body);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: e.message || String(e) });
+  }
+});
 
 // boot
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`CRT items proxy running on ${PORT}`);
 });
-
-
