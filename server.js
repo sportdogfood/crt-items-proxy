@@ -117,7 +117,8 @@ async function commitText(rel, bodyText, message) {
     throw e;
   }
 
-  const repoPath = `items/${String(rel).replace(/^items\//, "")}`;
+ // const repoPath = `items/${String(rel).replace(/^items\//, "")}`;
+  const repoPath = String(rel).replace(/^\/+/, ""); // ← changed
   const api = `https://api.github.com/repos/${GITHUB_REPO}/contents/${repoPath}`;
   const headers = {
     Authorization: `Bearer ${GITHUB_TOKEN}`,
@@ -302,7 +303,8 @@ app.post("/items/commit", async (req, res) => {
     const token = process.env.GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
-    const repoPath = `items/${rel}`;
+    //const repoPath = `items/${rel}`;
+     const repoPath = rel; // ← changed
     const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
     const headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "crt-items-proxy" };
 
