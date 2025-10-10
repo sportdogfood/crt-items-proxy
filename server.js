@@ -225,6 +225,199 @@ async function listDir(dir) {
 }
 
 // Common handler used by routes
+
+// ADD ABOVE the /docs/commit-bulk route (place near other helpers)
+async function buildFilesFromTrigger(trigger) {
+  // trigger: { add_post, canonical_base, images_link?, allow_urls?[] }
+  if (!trigger || !trigger.add_post) {
+    const e = new Error("trigger.add_post required"); e.code = 400; throw e;
+  }
+  const addUrl = String(trigger.add_post).trim();
+  if (!/^https:\/\/raw\.githubusercontent\.com\//i.test(addUrl)) {
+    const e = new Error("add_post must be raw.githubusercontent.com"); e.code = 400; throw e;
+  }
+
+  // Fetch the post JSON
+  const postResp = await fetchWithRetry(addUrl, {}, { attempts: 2, timeoutMs: 6000 });
+  if (!postResp.ok) { const t = await postResp.text(); const e = new Error(`add_post fetch ${postResp.status}: ${t}`); e.code = 400; throw e; }
+  const postJson = await postResp.json();
+
+  // Parse venue/year/slug from filename + parent folder
+  // Expect: .../docs/blogs/{venue}-blogs-{year}/{slug}/{slug}.json
+  const m = addUrl.match(/\/docs\/blogs\/([^/]+)-blogs-(\d{4})\/([^/]+)\/\3\.json$/i);
+  if (!m) { const e = new Error("add_post path does not match expected blog structure"); e.code = 400; throw e; }
+  const venue = m[1], year = m[2], slug = m[3];
+
+  // Derive canonical + paths
+  const canonicalBase = String(trigger.canonical_base || "https://blog.clearroundtravel.com").replace(/\/+$/,"");
+  const postPath = `docs/blogs/${venue}-blogs-${year}/${slug}/`;
+  const jsonRel  = `${postPath}${slug}.json`;
+  const indexRel = `${postPath}index.html`;
+  const manifestRel = `docs/blogs/manifest.json`;
+  const rssRel = `docs/blogs/rss.xml`;
+  const sitemapRel = `docs/sitemap.xml`;
+
+  // Read existing manifest
+  let manifest = [];
+  try {
+    const manUrl = `${UPSTREAM_BASE.replace(/\/+$/,"")}/${manifestRel}`;
+    const manResp = await fetchWithRetry(manUrl, {}, { attempts: 2, timeoutMs: 5000 });
+    if (manResp.ok) manifest = await manResp.json();
+  } catch {}
+  if (!Array.isArray(manifest)) manifest = [];
+
+  // Compute minimal fields
+  const title = postJson?.seo?.section_title || postJson?.seo?.open_graph_title || slug;
+  // prefer filename date in slug: {venue}-blog-YYYY-MM-DD
+  const dateMatch = slug.match(/-(\d{4}-\d{2}-\d{2})$/);
+  const date = dateMatch ? dateMatch[1] : (postJson?.meta?.timestamp_iso || "").slice(0,10);
+  const month_num = date ? date.slice(5,7) : "";
+  const month_name = month_num ? ["","January","February","March","April","May","June","July","August","September","October","November","December"][parseInt(month_num,10)] : "";
+  const season = (() => {
+    const m = parseInt(month_num||"0",10);
+    if (m===12||m===1||m===2) return "winter";
+    if (m>=3 && m<=5) return "spring";
+    if (m>=6 && m<=8) return "summer";
+    if (m>=9 && m<=11) return "fall";
+    return "";
+  })();
+
+  // Optional images_link for card image
+  let card_image = "/assets/images/card-placeholder.jpg";
+  if (trigger.images_link) {
+    try {
+      const imgResp = await fetchWithRetry(trigger.images_link, {}, { attempts: 2, timeoutMs: 5000 });
+      if (imgResp.ok) {
+        const imgs = await imgResp.json();
+        if (imgs?.card_image_link) card_image = imgs.card_image_link;
+      }
+    } catch {}
+  }
+
+  // Upsert manifest entry
+  const pathPublic = `/blogs/${venue}-blogs-${year}/${slug}/`;
+  const jsonPublic = `/${jsonRel.replace(/^docs\//,"")}`;
+  const entry = {
+    slug, title, date,
+    year, month_num, month_name, season,
+    path: pathPublic,
+    json: jsonPublic,
+    image: card_image,
+    venue,
+  };
+  const idx = manifest.findIndex(x => x.slug === slug);
+  if (idx >= 0) manifest[idx] = { ...manifest[idx], ...entry };
+  else manifest.push(entry);
+
+  // Minimal index.html placeholder (does NOT overwrite the JSON)
+  const html = [
+    "<!doctype html>",
+    "<html><head>",
+    `<meta charset="utf-8"><title>${title}</title>`,
+    `<link rel="canonical" href="${canonicalBase}${pathPublic}">`,
+    `<meta name="viewport" content="width=device-width,initial-scale=1">`,
+    "</head><body>",
+    `<main><h1>${title}</h1>`,
+    `<p>Post shell for <code>${slug}</code>. Body JSON lives at <a href="/${jsonRel.replace(/^docs\//,"")}">${slug}.json</a>.</p>`,
+    `<p>This placeholder exists so Structure Runner templates can hydrate later.</p>`,
+    `<nav><a href="/blogs/">All blogs</a></nav>`,
+    "</main>",
+    "</body></html>\n"
+  ].join("");
+
+  // Rebuild RSS and sitemap very simply (placeholders; your full templates will replace)
+  const rss = `<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Blog RSS</title>${manifest
+    .slice()
+    .sort((a,b)=>String(b.date).localeCompare(a.date))
+    .slice(0,20)
+    .map(it=>`<item><title>${it.title}</title><link>${canonicalBase}${it.path}</link><pubDate>${it.date}</pubDate></item>`).join("")}</channel></rss>\n`;
+
+  const smUrls = [
+    `${canonicalBase}/blogs/`,
+    ...manifest.map(it => `${canonicalBase}${it.path}`)
+  ];
+  const sitemap = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${smUrls.map(u=>`<url><loc>${u}</loc></url>`).join("")}</urlset>\n`;
+
+  // Build basic /blogs/ and /blogs/{year}/ indexes from manifest (until templates hydrate)
+  const bySeason = (list) => ({
+    winter: list.filter(x => x.season === "winter"),
+    spring: list.filter(x => x.season === "spring"),
+    summer: list.filter(x => x.season === "summer"),
+    fall:   list.filter(x => x.season === "fall"),
+  });
+
+  const renderCards = (items) => items.map(it => `
+    <article class="card">
+      <a href="${it.path}">
+        <img loading="lazy" src="${it.image || "/assets/images/card-placeholder.jpg"}" alt="${(it.title||"").replace(/"/g,"&quot;")}">
+        <h3>${it.title || it.slug}</h3>
+        <p>${it.date || ""}</p>
+      </a>
+    </article>`).join("");
+
+  const renderSection = (label, items) => items.length ? `
+    <section class="section">
+      <header><h2>${label}</h2><a class="see-all" href="/blogs/?season=${label.toLowerCase()}">See all &rsaquo;</a></header>
+      <div class="carousel">${renderCards(items)}</div>
+    </section>` : "";
+
+  const styles = `
+    <style>
+      body{margin:0;background:#111315;color:#f1f1f1;font-family:system-ui,"Segoe UI",sans-serif}
+      main{max-width:1100px;margin:0 auto;padding:40px 20px}
+      .section{margin:28px 0}
+      .section header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+      .carousel{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(230px,1fr);gap:16px;overflow-x:auto;padding-bottom:6px}
+      .card{background:#1a1d1f;border-radius:16px;box-shadow:0 0 0 1px rgba(255,255,255,.06) inset}
+      .card img{width:100%;height:148px;object-fit:cover;border-top-left-radius:16px;border-top-right-radius:16px;display:block}
+      .card h3{font-size:16px;margin:10px 12px 6px}
+      .card p{font-size:13px;color:#a0a0a0;margin:0 12px 12px}
+      a{color:#8bb7ff;text-decoration:none}
+      .see-all{font-size:14px;color:#a0c4ff}
+      nav.breadcrumbs{max-width:1100px;margin:0 auto;padding:12px 20px;color:#a0a0a0;font-size:14px}
+      .sr-only{position:absolute;left:-9999px}
+    </style>
+  `;
+
+  const allSorted = manifest.slice().sort((a,b)=>String(b.date).localeCompare(a.date));
+  const seasonsAll = bySeason(allSorted);
+  const blogsIndexHtml = `<!doctype html><html><head><meta charset="utf-8">
+    <title>Blogs</title><meta name="viewport" content="width=device-width,initial-scale=1">${styles}</head>
+    <body><nav class="breadcrumbs">Home / Blogs</nav><main>
+      ${renderSection("Fall",   seasonsAll.fall)}
+      ${renderSection("Summer", seasonsAll.summer)}
+      ${renderSection("Spring", seasonsAll.spring)}
+      ${renderSection("Winter", seasonsAll.winter)}
+    </main></body></html>\n`;
+
+  const yearList = allSorted.filter(x => x.year === year);
+  const seasonsYear = bySeason(yearList);
+  const yearIndexHtml = `<!doctype html><html><head><meta charset="utf-8">
+    <title>Blogs ${year}</title><meta name="viewport" content="width=device-width,initial-scale=1">${styles}</head>
+    <body><nav class="breadcrumbs">Home / Blogs / ${year}</nav><main>
+      ${renderSection("Fall",   seasonsYear.fall)}
+      ${renderSection("Summer", seasonsYear.summer)}
+      ${renderSection("Spring", seasonsYear.spring)}
+      ${renderSection("Winter", seasonsYear.winter)}
+    </main></body></html>\n`;
+
+  // Return files[] for bulk commit
+  const enc = (s) => Buffer.from(s, "utf8").toString("base64");
+  return {
+    message: `chore: scaffold ${slug}`,
+    overwrite: true,
+    files: [
+      { path: manifestRel,              content_type: "application/json", content_base64: enc(JSON.stringify(manifest, null, 2) + "\n") },
+      { path: rssRel,                   content_type: "application/xml",  content_base64: enc(rss) },
+      { path: sitemapRel,               content_type: "application/xml",  content_base64: enc(sitemap) },
+      { path: "docs/blogs/index.html",  content_type: "text/html",        content_base64: enc(blogsIndexHtml) },
+      { path: `docs/blogs/${year}/index.html`, content_type: "text/html", content_base64: enc(yearIndexHtml) }
+      // NOTE: we DO NOT include the post JSON; never overwrite add_post payload.
+    ]
+  };
+
+}
+
 async function handleItems(req, res, { head = false } = {}) {
   const rel = (req.params[0] || "").trim();
   if (!isAllowedPath(rel)) return res.status(400).end(head ? "" : JSON.stringify({ error: "Bad path" }));
@@ -358,54 +551,44 @@ app.post("/items/commit", async (req, res) => {
     res.status(500).json({ error: "Commit failed" });
   }
 });
-
-// --- /docs/commit (mirror of /items/commit but forces docs/ and JSON only)
+// --- /docs/commit (JSON-only single-file commit)
 app.post("/docs/commit", async (req, res) => {
   try {
     let { path: p, json, message } = req.body || {};
     if (!p || json === undefined || json === null) {
       return res.status(400).json({ error: "path and json required" });
     }
-
     // normalize + enforce docs/
     let rel = String(p).trim().replace(/^\/+/, "").replace(/^docs\//, "");
-    // For docs we enforce JSON files
     if (!/\.json$/i.test(rel)) return res.status(400).json({ error: "Docs commits require a .json file path" });
-
-    // We do not rely on ALLOW_DIRS for docs; we force prefix to docs/
-    const repoPath = `docs/${rel}`;
-
-    // stringify JSON payload
-    let contentStr;
-    try {
-      contentStr = JSON.stringify(typeof json === "string" ? JSON.parse(json) : json, null, 2) + "\n";
-    } catch (e) {
-      return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` });
-    }
 
     const repo   = process.env.GITHUB_REPO;
     const branch = process.env.GITHUB_BRANCH || "main";
     const token  = process.env.GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
+    // stringify JSON payload
+    let contentStr;
+    try { contentStr = JSON.stringify(typeof json === "string" ? JSON.parse(json) : json, null, 2) + "\n"; }
+    catch (e) { return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` }); }
+
+    const repoPath = `docs/${rel}`;
     const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
-    const headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "crt-items-proxy" };
+    const headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "crt-docs-proxy" };
 
     // existing SHA
     let sha;
     const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
     if (head.ok) { const meta = await head.json(); sha = meta.sha; }
 
-    const body = { message: message || `chore: commit ${repoPath} via proxy`, content: Buffer.from(contentStr, "utf8").toString("base64"), branch };
+    const body = { message: message || `chore: commit ${repoPath}`, content: Buffer.from(contentStr, "utf8").toString("base64"), branch };
     if (sha) body.sha = sha;
 
     const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
     const result = await put.json();
     if (!put.ok) return res.status(put.status).json(result);
 
-    // invalidate any cache for this rel if you keep one; keying with docs path
     memoryCache.delete(`docs/${rel}`);
-
     return res.status(200).json({ ok: true, path: repoPath, commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url } });
   } catch (e) {
     console.error(e);
@@ -413,40 +596,23 @@ app.post("/docs/commit", async (req, res) => {
   }
 });
 
-// GET /docs/* -> proxy-read from upstream repo (raw)
-app.get("/docs/*", async (req, res) => {
-  try {
-    // normalize and enforce docs/
-    const relParam = String(req.params[0] || "").trim().replace(/^\/+/, "");
-    const clean = relParam.replace(/^docs\//, "");
-    const repoPath = `docs/${clean}`;
-
-    const upstream = `${UPSTREAM_BASE.replace(/\/+$/, "")}/${repoPath}`;
-    try { assertAllowedUpstream(upstream); } catch (e) { return res.status(e.code || 400).json({ error: e.message }); }
-
-    const resp = await fetchWithRetry(upstream, { method: "GET" }, { attempts: 2, timeoutMs: 5000 });
-    if (!resp.ok) {
-      return res.status(resp.status).json({ error: `Upstream ${resp.status}`, path: repoPath });
-    }
-
-    const isJson = /\.json($|\?)/i.test(repoPath);
-    res.set("Cache-Control", `public, max-age=${Number(CACHE_TTL) || 0}`);
-    res.type(isJson ? "application/json; charset=utf-8" : "text/plain; charset=utf-8");
-
-    const body = await resp.text();
-    return res.status(200).send(body);
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: e.message || String(e) });
-  }
-});
-
-// --- /docs/commit-bulk (single Git commit for multiple docs/* files; accepts .html, .xml, .json)
+// --- /docs/commit (mirror of /items/commit but forces docs/ and JSON only)
+// REPLACE the /docs/commit-bulk route with this updated version (lines before/after kept)
 app.post("/docs/commit-bulk", async (req, res) => {
   try {
-    const { message, overwrite, files } = req.body || {};
+    let { message, overwrite, files, trigger, add_post, canonical_base, images_link, allow_urls } = req.body || {};
+
+    // NEW: accept trigger payload either under `trigger` or top-level fields
+    if (!files && (trigger || add_post)) {
+      const trig = trigger || { add_post, canonical_base, images_link, allow_urls };
+      const built = await buildFilesFromTrigger(trig);
+      message = built.message;
+      overwrite = built.overwrite;
+      files = built.files;
+    }
+
     if (!Array.isArray(files) || files.length === 0) {
-      return res.status(400).json({ error: "files[] required" });
+      return res.status(400).json({ error: "files[] required or provide trigger.add_post" });
     }
 
     const repo   = process.env.GITHUB_REPO;
@@ -504,12 +670,7 @@ app.post("/docs/commit-bulk", async (req, res) => {
     }
 
     // Create tree
-    const tree = blobShas.map(x => ({
-      path: x.path,
-      mode: "100644",
-      type: "blob",
-      sha: x.sha
-    }));
+    const tree = blobShas.map(x => ({ path: x.path, mode: "100644", type: "blob", sha: x.sha }));
     const treeResp = await gh(`https://api.github.com/repos/${repo}/git/trees`, {
       method: "POST",
       body: JSON.stringify({ base_tree: baseTreeSha, tree })
@@ -529,31 +690,55 @@ app.post("/docs/commit-bulk", async (req, res) => {
     const newCommitSha = commitPostJson.sha;
 
     // Update ref
-    const refPatch = await gh(refUrl, {
-      method: "PATCH",
-      body: JSON.stringify({ sha: newCommitSha, force: !!overwrite })
-    });
+    const refPatch = await gh(refUrl, { method: "PATCH", body: JSON.stringify({ sha: newCommitSha, force: !!overwrite }) });
     const refPatchJson = await refPatch.json();
     if (!refPatch.ok) return res.status(refPatch.status).json({ error: `ref-patch ${refPatch.status}`, details: refPatchJson });
 
     // Invalidate simple cache entries
     for (const f of norm) {
-      memoryCache.delete(f.path);          // exact docs/… key
-      memoryCache.delete(f.path.replace(/^docs\//, "")); // fallback variant
+      memoryCache.delete(f.path);
+      memoryCache.delete(f.path.replace(/^docs\//, ""));
     }
 
     const committed_paths = norm.map(f => f.path);
     const htmlUrl = commitPostJson.html_url || `https://github.com/${repo}/commit/${newCommitSha}`;
-    return res.status(200).json({
-      ok: true,
-      commit: { sha: newCommitSha, url: htmlUrl },
-      committed_paths
-    });
+    return res.status(200).json({ ok: true, commit: { sha: newCommitSha, url: htmlUrl }, committed_paths });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: e.message || "bulk commit failed" });
   }
 });
+
+
+// GET /docs/* -> proxy-read from upstream repo (raw)
+app.get("/docs/*", async (req, res) => {
+  try {
+    // normalize and enforce docs/
+    const relParam = String(req.params[0] || "").trim().replace(/^\/+/, "");
+    const clean = relParam.replace(/^docs\//, "");
+    const repoPath = `docs/${clean}`;
+
+    const upstream = `${UPSTREAM_BASE.replace(/\/+$/, "")}/${repoPath}`;
+    try { assertAllowedUpstream(upstream); } catch (e) { return res.status(e.code || 400).json({ error: e.message }); }
+
+    const resp = await fetchWithRetry(upstream, { method: "GET" }, { attempts: 2, timeoutMs: 5000 });
+    if (!resp.ok) {
+      return res.status(resp.status).json({ error: `Upstream ${resp.status}`, path: repoPath });
+    }
+
+    const isJson = /\.json($|\?)/i.test(repoPath);
+    res.set("Cache-Control", `public, max-age=${Number(CACHE_TTL) || 0}`);
+    res.type(isJson ? "application/json; charset=utf-8" : "text/plain; charset=utf-8");
+
+    const body = await resp.text();
+    return res.status(200).send(body);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: e.message || String(e) });
+  }
+});
+
+
 
 // boot
 const PORT = process.env.PORT || 3000;
