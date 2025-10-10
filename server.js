@@ -338,19 +338,85 @@ async function buildFilesFromTrigger(trigger) {
   ];
   const sitemap = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${smUrls.map(u=>`<url><loc>${u}</loc></url>`).join("")}</urlset>\n`;
 
+  // Build basic /blogs/ and /blogs/{year}/ indexes from manifest (until templates hydrate)
+  const bySeason = (list) => ({
+    winter: list.filter(x => x.season === "winter"),
+    spring: list.filter(x => x.season === "spring"),
+    summer: list.filter(x => x.season === "summer"),
+    fall:   list.filter(x => x.season === "fall"),
+  });
+
+  const renderCards = (items) => items.map(it => `
+    <article class="card">
+      <a href="${it.path}">
+        <img loading="lazy" src="${it.image || "/assets/images/card-placeholder.jpg"}" alt="${(it.title||"").replace(/"/g,"&quot;")}">
+        <h3>${it.title || it.slug}</h3>
+        <p>${it.date || ""}</p>
+      </a>
+    </article>`).join("");
+
+  const renderSection = (label, items) => items.length ? `
+    <section class="section">
+      <header><h2>${label}</h2><a class="see-all" href="/blogs/?season=${label.toLowerCase()}">See all &rsaquo;</a></header>
+      <div class="carousel">${renderCards(items)}</div>
+    </section>` : "";
+
+  const styles = `
+    <style>
+      body{margin:0;background:#111315;color:#f1f1f1;font-family:system-ui,"Segoe UI",sans-serif}
+      main{max-width:1100px;margin:0 auto;padding:40px 20px}
+      .section{margin:28px 0}
+      .section header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
+      .carousel{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(230px,1fr);gap:16px;overflow-x:auto;padding-bottom:6px}
+      .card{background:#1a1d1f;border-radius:16px;box-shadow:0 0 0 1px rgba(255,255,255,.06) inset}
+      .card img{width:100%;height:148px;object-fit:cover;border-top-left-radius:16px;border-top-right-radius:16px;display:block}
+      .card h3{font-size:16px;margin:10px 12px 6px}
+      .card p{font-size:13px;color:#a0a0a0;margin:0 12px 12px}
+      a{color:#8bb7ff;text-decoration:none}
+      .see-all{font-size:14px;color:#a0c4ff}
+      nav.breadcrumbs{max-width:1100px;margin:0 auto;padding:12px 20px;color:#a0a0a0;font-size:14px}
+      .sr-only{position:absolute;left:-9999px}
+    </style>
+  `;
+
+  const allSorted = manifest.slice().sort((a,b)=>String(b.date).localeCompare(a.date));
+  const seasonsAll = bySeason(allSorted);
+  const blogsIndexHtml = `<!doctype html><html><head><meta charset="utf-8">
+    <title>Blogs</title><meta name="viewport" content="width=device-width,initial-scale=1">${styles}</head>
+    <body><nav class="breadcrumbs">Home / Blogs</nav><main>
+      ${renderSection("Fall",   seasonsAll.fall)}
+      ${renderSection("Summer", seasonsAll.summer)}
+      ${renderSection("Spring", seasonsAll.spring)}
+      ${renderSection("Winter", seasonsAll.winter)}
+    </main></body></html>\n`;
+
+  const yearList = allSorted.filter(x => x.year === year);
+  const seasonsYear = bySeason(yearList);
+  const yearIndexHtml = `<!doctype html><html><head><meta charset="utf-8">
+    <title>Blogs ${year}</title><meta name="viewport" content="width=device-width,initial-scale=1">${styles}</head>
+    <body><nav class="breadcrumbs">Home / Blogs / ${year}</nav><main>
+      ${renderSection("Fall",   seasonsYear.fall)}
+      ${renderSection("Summer", seasonsYear.summer)}
+      ${renderSection("Spring", seasonsYear.spring)}
+      ${renderSection("Winter", seasonsYear.winter)}
+    </main></body></html>\n`;
+
   // Return files[] for bulk commit
   const enc = (s) => Buffer.from(s, "utf8").toString("base64");
   return {
     message: `chore: scaffold ${slug}`,
     overwrite: true,
     files: [
-      { path: indexRel, content_type: "text/html", content_base64: enc(html) },
-      { path: manifestRel, content_type: "application/json", content_base64: enc(JSON.stringify(manifest, null, 2) + "\n") },
-      { path: rssRel, content_type: "application/xml", content_base64: enc(rss) },
-      { path: sitemapRel, content_type: "application/xml", content_base64: enc(sitemap) }
-      // NOTE: we DO NOT include the post JSON; we never overwrite add_post payload.
+      { path: indexRel,                 content_type: "text/html",        content_base64: enc(html) },
+      { path: manifestRel,              content_type: "application/json", content_base64: enc(JSON.stringify(manifest, null, 2) + "\n") },
+      { path: rssRel,                   content_type: "application/xml",  content_base64: enc(rss) },
+      { path: sitemapRel,               content_type: "application/xml",  content_base64: enc(sitemap) },
+      { path: "docs/blogs/index.html",  content_type: "text/html",        content_base64: enc(blogsIndexHtml) },
+      { path: `docs/blogs/${year}/index.html`, content_type: "text/html", content_base64: enc(yearIndexHtml) }
+      // NOTE: we DO NOT include the post JSON; never overwrite add_post payload.
     ]
   };
+
 }
 
 async function handleItems(req, res, { head = false } = {}) {
