@@ -407,7 +407,6 @@ async function buildFilesFromTrigger(trigger) {
     message: `chore: scaffold ${slug}`,
     overwrite: true,
     files: [
-    
       { path: manifestRel,              content_type: "application/json", content_base64: enc(JSON.stringify(manifest, null, 2) + "\n") },
       { path: rssRel,                   content_type: "application/xml",  content_base64: enc(rss) },
       { path: sitemapRel,               content_type: "application/xml",  content_base64: enc(sitemap) },
