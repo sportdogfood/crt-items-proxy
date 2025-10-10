@@ -225,6 +225,134 @@ async function listDir(dir) {
 }
 
 // Common handler used by routes
+
+// ADD ABOVE the /docs/commit-bulk route (place near other helpers)
+async function buildFilesFromTrigger(trigger) {
+  // trigger: { add_post, canonical_base, images_link?, allow_urls?[] }
+  if (!trigger || !trigger.add_post) {
+    const e = new Error("trigger.add_post required"); e.code = 400; throw e;
+  }
+  const addUrl = String(trigger.add_post).trim();
+  if (!/^https:\/\/raw\.githubusercontent\.com\//i.test(addUrl)) {
+    const e = new Error("add_post must be raw.githubusercontent.com"); e.code = 400; throw e;
+  }
+
+  // Fetch the post JSON
+  const postResp = await fetchWithRetry(addUrl, {}, { attempts: 2, timeoutMs: 6000 });
+  if (!postResp.ok) { const t = await postResp.text(); const e = new Error(`add_post fetch ${postResp.status}: ${t}`); e.code = 400; throw e; }
+  const postJson = await postResp.json();
+
+  // Parse venue/year/slug from filename + parent folder
+  // Expect: .../docs/blogs/{venue}-blogs-{year}/{slug}/{slug}.json
+  const m = addUrl.match(/\/docs\/blogs\/([^/]+)-blogs-(\d{4})\/([^/]+)\/\3\.json$/i);
+  if (!m) { const e = new Error("add_post path does not match expected blog structure"); e.code = 400; throw e; }
+  const venue = m[1], year = m[2], slug = m[3];
+
+  // Derive canonical + paths
+  const canonicalBase = String(trigger.canonical_base || "https://blog.clearroundtravel.com").replace(/\/+$/,"");
+  const postPath = `docs/blogs/${venue}-blogs-${year}/${slug}/`;
+  const jsonRel  = `${postPath}${slug}.json`;
+  const indexRel = `${postPath}index.html`;
+  const manifestRel = `docs/blogs/manifest.json`;
+  const rssRel = `docs/blogs/rss.xml`;
+  const sitemapRel = `docs/sitemap.xml`;
+
+  // Read existing manifest
+  let manifest = [];
+  try {
+    const manUrl = `${UPSTREAM_BASE.replace(/\/+$/,"")}/${manifestRel}`;
+    const manResp = await fetchWithRetry(manUrl, {}, { attempts: 2, timeoutMs: 5000 });
+    if (manResp.ok) manifest = await manResp.json();
+  } catch {}
+  if (!Array.isArray(manifest)) manifest = [];
+
+  // Compute minimal fields
+  const title = postJson?.seo?.section_title || postJson?.seo?.open_graph_title || slug;
+  // prefer filename date in slug: {venue}-blog-YYYY-MM-DD
+  const dateMatch = slug.match(/-(\d{4}-\d{2}-\d{2})$/);
+  const date = dateMatch ? dateMatch[1] : (postJson?.meta?.timestamp_iso || "").slice(0,10);
+  const month_num = date ? date.slice(5,7) : "";
+  const month_name = month_num ? ["","January","February","March","April","May","June","July","August","September","October","November","December"][parseInt(month_num,10)] : "";
+  const season = (() => {
+    const m = parseInt(month_num||"0",10);
+    if (m===12||m===1||m===2) return "winter";
+    if (m>=3 && m<=5) return "spring";
+    if (m>=6 && m<=8) return "summer";
+    if (m>=9 && m<=11) return "fall";
+    return "";
+  })();
+
+  // Optional images_link for card image
+  let card_image = "/assets/images/card-placeholder.jpg";
+  if (trigger.images_link) {
+    try {
+      const imgResp = await fetchWithRetry(trigger.images_link, {}, { attempts: 2, timeoutMs: 5000 });
+      if (imgResp.ok) {
+        const imgs = await imgResp.json();
+        if (imgs?.card_image_link) card_image = imgs.card_image_link;
+      }
+    } catch {}
+  }
+
+  // Upsert manifest entry
+  const pathPublic = `/blogs/${venue}-blogs-${year}/${slug}/`;
+  const jsonPublic = `/${jsonRel.replace(/^docs\//,"")}`;
+  const entry = {
+    slug, title, date,
+    year, month_num, month_name, season,
+    path: pathPublic,
+    json: jsonPublic,
+    image: card_image,
+    venue,
+  };
+  const idx = manifest.findIndex(x => x.slug === slug);
+  if (idx >= 0) manifest[idx] = { ...manifest[idx], ...entry };
+  else manifest.push(entry);
+
+  // Minimal index.html placeholder (does NOT overwrite the JSON)
+  const html = [
+    "<!doctype html>",
+    "<html><head>",
+    `<meta charset="utf-8"><title>${title}</title>`,
+    `<link rel="canonical" href="${canonicalBase}${pathPublic}">`,
+    `<meta name="viewport" content="width=device-width,initial-scale=1">`,
+    "</head><body>",
+    `<main><h1>${title}</h1>`,
+    `<p>Post shell for <code>${slug}</code>. Body JSON lives at <a href="/${jsonRel.replace(/^docs\//,"")}">${slug}.json</a>.</p>`,
+    `<p>This placeholder exists so Structure Runner templates can hydrate later.</p>`,
+    `<nav><a href="/blogs/">All blogs</a></nav>`,
+    "</main>",
+    "</body></html>\n"
+  ].join("");
+
+  // Rebuild RSS and sitemap very simply (placeholders; your full templates will replace)
+  const rss = `<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Blog RSS</title>${manifest
+    .slice()
+    .sort((a,b)=>String(b.date).localeCompare(a.date))
+    .slice(0,20)
+    .map(it=>`<item><title>${it.title}</title><link>${canonicalBase}${it.path}</link><pubDate>${it.date}</pubDate></item>`).join("")}</channel></rss>\n`;
+
+  const smUrls = [
+    `${canonicalBase}/blogs/`,
+    ...manifest.map(it => `${canonicalBase}${it.path}`)
+  ];
+  const sitemap = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${smUrls.map(u=>`<url><loc>${u}</loc></url>`).join("")}</urlset>\n`;
+
+  // Return files[] for bulk commit
+  const enc = (s) => Buffer.from(s, "utf8").toString("base64");
+  return {
+    message: `chore: scaffold ${slug}`,
+    overwrite: true,
+    files: [
+      { path: indexRel, content_type: "text/html", content_base64: enc(html) },
+      { path: manifestRel, content_type: "application/json", content_base64: enc(JSON.stringify(manifest, null, 2) + "\n") },
+      { path: rssRel, content_type: "application/xml", content_base64: enc(rss) },
+      { path: sitemapRel, content_type: "application/xml", content_base64: enc(sitemap) }
+      // NOTE: we DO NOT include the post JSON; we never overwrite add_post payload.
+    ]
+  };
+}
+
 async function handleItems(req, res, { head = false } = {}) {
   const rel = (req.params[0] || "").trim();
   if (!isAllowedPath(rel)) return res.status(400).end(head ? "" : JSON.stringify({ error: "Bad path" }));
@@ -360,27 +488,22 @@ app.post("/items/commit", async (req, res) => {
 });
 
 // --- /docs/commit (mirror of /items/commit but forces docs/ and JSON only)
-app.post("/docs/commit", async (req, res) => {
+// REPLACE the /docs/commit-bulk route with this updated version (lines before/after kept)
+app.post("/docs/commit-bulk", async (req, res) => {
   try {
-    let { path: p, json, message } = req.body || {};
-    if (!p || json === undefined || json === null) {
-      return res.status(400).json({ error: "path and json required" });
+    let { message, overwrite, files, trigger, add_post, canonical_base, images_link, allow_urls } = req.body || {};
+
+    // NEW: accept trigger payload either under `trigger` or top-level fields
+    if (!files && (trigger || add_post)) {
+      const trig = trigger || { add_post, canonical_base, images_link, allow_urls };
+      const built = await buildFilesFromTrigger(trig);
+      message = built.message;
+      overwrite = built.overwrite;
+      files = built.files;
     }
 
-    // normalize + enforce docs/
-    let rel = String(p).trim().replace(/^\/+/, "").replace(/^docs\//, "");
-    // For docs we enforce JSON files
-    if (!/\.json$/i.test(rel)) return res.status(400).json({ error: "Docs commits require a .json file path" });
-
-    // We do not rely on ALLOW_DIRS for docs; we force prefix to docs/
-    const repoPath = `docs/${rel}`;
-
-    // stringify JSON payload
-    let contentStr;
-    try {
-      contentStr = JSON.stringify(typeof json === "string" ? JSON.parse(json) : json, null, 2) + "\n";
-    } catch (e) {
-      return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` });
+    if (!Array.isArray(files) || files.length === 0) {
+      return res.status(400).json({ error: "files[] required or provide trigger.add_post" });
     }
 
     const repo   = process.env.GITHUB_REPO;
@@ -388,30 +511,95 @@ app.post("/docs/commit", async (req, res) => {
     const token  = process.env.GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
-    const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
-    const headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "crt-items-proxy" };
+    // Validate files
+    const allowedExt = /\.(html|xml|json)$/i;
+    const norm = files.map((f, i) => {
+      const p = String(f.path || "").trim().replace(/^\/+/, "");
+      if (!p || !p.toLowerCase().startsWith("docs/")) throw new Error(`Bad path at index ${i}`);
+      if (p.includes("..")) throw new Error(`Unsafe path at index ${i}`);
+      if (!allowedExt.test(p)) throw new Error(`Disallowed extension at index ${i}`);
+      const content_base64 = String(f.content_base64 || "");
+      if (!content_base64) throw new Error(`Missing content_base64 at index ${i}`);
+      return { path: p, b64: content_base64 };
+    });
 
-    // existing SHA
-    let sha;
-    const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
-    if (head.ok) { const meta = await head.json(); sha = meta.sha; }
+    // GitHub API helpers
+    const gh = async (url, opts = {}, attempts = 2, timeoutMs = 7000) => {
+      const headers = {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "User-Agent": "crt-docs-proxy",
+        ...(opts.headers || {})
+      };
+      return fetchWithRetry(url, { ...opts, headers }, { attempts, timeoutMs });
+    };
 
-    const body = { message: message || `chore: commit ${repoPath} via proxy`, content: Buffer.from(contentStr, "utf8").toString("base64"), branch };
-    if (sha) body.sha = sha;
+    // Resolve refs and base tree
+    const refUrl = `https://api.github.com/repos/${repo}/git/refs/heads/${encodeURIComponent(branch)}`;
+    const refResp = await gh(refUrl);
+    if (!refResp.ok) return res.status(refResp.status).json({ error: `ref ${refResp.status}` });
+    const refJson = await refResp.json();
+    const baseCommitSha = refJson.object?.sha;
+    if (!baseCommitSha) return res.status(500).json({ error: "Missing base commit sha" });
 
-    const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
-    const result = await put.json();
-    if (!put.ok) return res.status(put.status).json(result);
+    const commitResp = await gh(`https://api.github.com/repos/${repo}/git/commits/${baseCommitSha}`);
+    if (!commitResp.ok) return res.status(commitResp.status).json({ error: `commit ${commitResp.status}` });
+    const commitJson = await commitResp.json();
+    const baseTreeSha = commitJson.tree?.sha;
+    if (!baseTreeSha) return res.status(500).json({ error: "Missing base tree sha" });
 
-    // invalidate any cache for this rel if you keep one; keying with docs path
-    memoryCache.delete(`docs/${rel}`);
+    // Create blobs
+    const blobShas = [];
+    for (const f of norm) {
+      const blobResp = await gh(`https://api.github.com/repos/${repo}/git/blobs`, {
+        method: "POST",
+        body: JSON.stringify({ content: f.b64, encoding: "base64" })
+      });
+      const blobJson = await blobResp.json();
+      if (!blobResp.ok) return res.status(blobResp.status).json({ error: `blob ${blobResp.status}`, details: blobJson });
+      blobShas.push({ path: f.path, sha: blobJson.sha });
+    }
 
-    return res.status(200).json({ ok: true, path: repoPath, commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url } });
+    // Create tree
+    const tree = blobShas.map(x => ({ path: x.path, mode: "100644", type: "blob", sha: x.sha }));
+    const treeResp = await gh(`https://api.github.com/repos/${repo}/git/trees`, {
+      method: "POST",
+      body: JSON.stringify({ base_tree: baseTreeSha, tree })
+    });
+    const treeJson = await treeResp.json();
+    if (!treeResp.ok) return res.status(treeResp.status).json({ error: `tree ${treeResp.status}`, details: treeJson });
+    const newTreeSha = treeJson.sha;
+
+    // Create commit
+    const msg = message || "chore: docs bulk update";
+    const commitPost = await gh(`https://api.github.com/repos/${repo}/git/commits`, {
+      method: "POST",
+      body: JSON.stringify({ message: msg, tree: newTreeSha, parents: [baseCommitSha] })
+    });
+    const commitPostJson = await commitPost.json();
+    if (!commitPost.ok) return res.status(commitPost.status).json({ error: `commit-post ${commitPost.status}`, details: commitPostJson });
+    const newCommitSha = commitPostJson.sha;
+
+    // Update ref
+    const refPatch = await gh(refUrl, { method: "PATCH", body: JSON.stringify({ sha: newCommitSha, force: !!overwrite }) });
+    const refPatchJson = await refPatch.json();
+    if (!refPatch.ok) return res.status(refPatch.status).json({ error: `ref-patch ${refPatch.status}`, details: refPatchJson });
+
+    // Invalidate simple cache entries
+    for (const f of norm) {
+      memoryCache.delete(f.path);
+      memoryCache.delete(f.path.replace(/^docs\//, ""));
+    }
+
+    const committed_paths = norm.map(f => f.path);
+    const htmlUrl = commitPostJson.html_url || `https://github.com/${repo}/commit/${newCommitSha}`;
+    return res.status(200).json({ ok: true, commit: { sha: newCommitSha, url: htmlUrl }, committed_paths });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ error: "Docs commit failed" });
+    return res.status(500).json({ error: e.message || "bulk commit failed" });
   }
 });
+
 
 // GET /docs/* -> proxy-read from upstream repo (raw)
 app.get("/docs/*", async (req, res) => {
