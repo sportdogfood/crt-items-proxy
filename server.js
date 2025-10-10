@@ -1,4 +1,3 @@
-
 // server.js — header and helpers (no routes)
 
 // Core imports
@@ -484,13 +483,13 @@ async function handleItems(req, res, { head = false } = {}) {
 }
 
 // Middleware (keep before routes)
-// Middleware (keep before routes)
 app.use(morgan("combined"));
 app.use(cors({ origin: "*" }));
 app.options("*", cors()); // handle preflight
-app.use(express.json());
 
-
+// IMPORTANT: raise body size limits for bulk base64 commits
+app.use(express.json({ limit: "5mb" }));
+app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
 // --- HEAD then GET for /items/* ---
 app.head("/items/*", async (req, res) => {
@@ -710,7 +709,6 @@ app.post("/docs/commit-bulk", async (req, res) => {
   }
 });
 
-
 // GET /docs/* -> proxy-read from upstream repo (raw)
 app.get("/docs/*", async (req, res) => {
   try {
@@ -738,8 +736,6 @@ app.get("/docs/*", async (req, res) => {
     return res.status(500).json({ error: e.message || String(e) });
   }
 });
-
-
 
 // boot
 const PORT = process.env.PORT || 3000;
