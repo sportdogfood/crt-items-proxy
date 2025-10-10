@@ -486,6 +486,50 @@ app.post("/items/commit", async (req, res) => {
     res.status(500).json({ error: "Commit failed" });
   }
 });
+// --- /docs/commit (JSON-only single-file commit)
+app.post("/docs/commit", async (req, res) => {
+  try {
+    let { path: p, json, message } = req.body || {};
+    if (!p || json === undefined || json === null) {
+      return res.status(400).json({ error: "path and json required" });
+    }
+    // normalize + enforce docs/
+    let rel = String(p).trim().replace(/^\/+/, "").replace(/^docs\//, "");
+    if (!/\.json$/i.test(rel)) return res.status(400).json({ error: "Docs commits require a .json file path" });
+
+    const repo   = process.env.GITHUB_REPO;
+    const branch = process.env.GITHUB_BRANCH || "main";
+    const token  = process.env.GITHUB_TOKEN;
+    if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
+
+    // stringify JSON payload
+    let contentStr;
+    try { contentStr = JSON.stringify(typeof json === "string" ? JSON.parse(json) : json, null, 2) + "\n"; }
+    catch (e) { return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` }); }
+
+    const repoPath = `docs/${rel}`;
+    const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
+    const headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "crt-docs-proxy" };
+
+    // existing SHA
+    let sha;
+    const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
+    if (head.ok) { const meta = await head.json(); sha = meta.sha; }
+
+    const body = { message: message || `chore: commit ${repoPath}`, content: Buffer.from(contentStr, "utf8").toString("base64"), branch };
+    if (sha) body.sha = sha;
+
+    const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
+    const result = await put.json();
+    if (!put.ok) return res.status(put.status).json(result);
+
+    memoryCache.delete(`docs/${rel}`);
+    return res.status(200).json({ ok: true, path: repoPath, commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url } });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Docs commit failed" });
+  }
+});
 
 // --- /docs/commit (mirror of /items/commit but forces docs/ and JSON only)
 // REPLACE the /docs/commit-bulk route with this updated version (lines before/after kept)
