@@ -1,12 +1,10 @@
-// server.js — header and helpers (no routes)
+// server.js — minimal proxy + commit APIs (no rendering, no runner logic)
 
 // Core imports
 const express = require("express");
 const fetch = require("node-fetch");
 const cors = require("cors");
 const morgan = require("morgan");
-const path = require("path");
-const fs = require("fs");
 require("dotenv").config();
 
 // App
@@ -16,22 +14,17 @@ const app = express();
 const UPSTREAM_BASE = process.env.UPSTREAM_BASE; // e.g. https://raw.githubusercontent.com/sportdogfood/clear-round-datasets/main
 if (!UPSTREAM_BASE) throw new Error("Missing UPSTREAM_BASE");
 
-// Allowed top-level dirs for /items/*
-const ALLOW_DIRS = new Set(
-  (process.env.ALLOW_DIRS || "items,items/runners,items/tasks,items/brand,items/venues,items/events,items/schema,items/gold,items/policy")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean)
-);
-
-// Domain allowlists
+// Always keep Airtable allowed in CORS origins (can add more via env)
 const ALLOW_ORIGINS = new Set(
-  (process.env.ALLOW_ORIGINS || "https://items.clearroundtravel.com,https://blog.clearroundtravel.com")
+  (process.env.ALLOW_ORIGINS ||
+    "https://items.clearroundtravel.com,https://blog.clearroundtravel.com,https://airtable.com,https://app.airtable.com,https://console.airtable.com"
+  )
     .split(",")
     .map(s => s.trim())
     .filter(Boolean)
 );
 
+// Enforce raw host allowlist
 const ALLOW_UPSTREAM_HOSTS = new Set(
   (process.env.ALLOW_UPSTREAM_HOSTS || "raw.githubusercontent.com")
     .split(",")
@@ -39,8 +32,18 @@ const ALLOW_UPSTREAM_HOSTS = new Set(
     .filter(Boolean)
 );
 
-const CACHE_TTL    = parseInt(process.env.CACHE_TTL || "300", 10);
-const STASH_PREFIX = process.env.STASH_PREFIX || "items/stash";
+// Directories allowed under /items/*
+const DEFAULT_ALLOW_DIRS =
+  "events,months,seasons,days,years,weeks,labels,places,sources,organizers,cities,countries,hotels,states,weather,airports,venues,restaurants,agents,dine,essentials,legs,distances,insiders,keywords,audience,tone,ratings,links,spots,sections,bullets,services,stay,amenities,slots,cuisines,menus,locale,things,tags,blogs,platforms,geos,timezones,geometry,chains,knowledge,levels,types,core,brand,meta,hubs,zones,seo,outputs,tasks,instructions,schema,gold,policy,docs,runners,images,assets";
+
+const ALLOW_DIRS = new Set(
+  (process.env.ALLOW_DIRS || DEFAULT_ALLOW_DIRS)
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+);
+
+const CACHE_TTL     = parseInt(process.env.CACHE_TTL || "300", 10);
 const GITHUB_REPO   = process.env.GITHUB_REPO;      // e.g. sportdogfood/clear-round-datasets
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
 const GITHUB_TOKEN  = process.env.GITHUB_TOKEN || "";
@@ -119,306 +122,7 @@ async function fetchWithRetry(url, options = {}, { attempts = 2, timeoutMs = 500
   throw lastErr;
 }
 
-// Safe path segments for /stash
-function safeSeg(s, allowDots = false) {
-  const re = allowDots ? /^[a-z0-9._-]+$/i : /^[a-z0-9_-]+$/i;
-  return typeof s === "string" && re.test(s) ? s : null;
-}
-
-function joinStashPath(folder, base, name) {
-  const f = safeSeg(folder) || "misc";
-  const b = safeSeg(base) || new Date().toISOString().replace(/[:.]/g, "").slice(0, 15);
-  const n = safeSeg(name, /*allowDots*/ true);
-  if (!n) return null;
-  return `${STASH_PREFIX}/${f}/${b}/${n}`.replace(/^items\//, "items/");
-}
-
-async function commitText(rel, bodyText, message) {
-  if (!GITHUB_REPO || !GITHUB_TOKEN) {
-    const e = new Error("Missing GITHUB_REPO or GITHUB_TOKEN");
-    e.code = 500;
-    throw e;
-  }
-  if (!isAllowedPath(rel)) {
-    const e = new Error("Path not allowed");
-    e.code = 400;
-    throw e;
-  }
-
-  const repoPath = `items/${String(rel).replace(/^items\//, "")}`;
-  const api = `https://api.github.com/repos/${GITHUB_REPO}/contents/${repoPath}`;
-  const headers = {
-    Authorization: `Bearer ${GITHUB_TOKEN}`,
-    Accept: "application/vnd.github+json",
-    "User-Agent": "crt-items-proxy"
-  };
-
-  // existing SHA
-  let sha;
-  const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(GITHUB_BRANCH)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
-  if (head.ok) {
-    const meta = await head.json();
-    sha = meta.sha;
-  }
-
-  const contentStr = String(bodyText).replace(/\r\n?/g, "\n");
-  const body = {
-    message: message || `stash: ${repoPath}`,
-    content: Buffer.from(contentStr, "utf8").toString("base64"),
-    branch: GITHUB_BRANCH
-  };
-  if (sha) body.sha = sha;
-
-  const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
-  const result = await put.json();
-  if (!put.ok) {
-    const e = new Error(result.message || "GitHub put failed");
-    e.code = put.status;
-    e.details = result;
-    throw e;
-  }
-
-  memoryCache.delete(rel);
-  return { path: repoPath, commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url } };
-}
-
-// Manifest helpers
-const RAW_RE = /^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/;
-const m = RAW_RE.exec(UPSTREAM_BASE);
-let GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH;
-
-console.log(`[startup] UPSTREAM_BASE='${UPSTREAM_BASE}'`);
-console.log(`[startup] ALLOW_DIRS=${Array.from(ALLOW_DIRS).join(",")}`);
-console.log(`[startup] ALLOW_ORIGINS=${Array.from(ALLOW_ORIGINS).join(",")}`);
-console.log(`[startup] ALLOW_UPSTREAM_HOSTS=${Array.from(ALLOW_UPSTREAM_HOSTS).join(",")}`);
-
-if (m) {
-  [, GH_OWNER, GH_REPO, GH_BRANCH, GH_BASEPATH] = m;
-  console.log(`[manifest] enabled for ${GH_OWNER}/${GH_REPO}@${GH_BRANCH} base='${GH_BASEPATH}'`);
-} else {
-  console.warn("[manifest] disabled: UPSTREAM_BASE is not raw.githubusercontent.com");
-}
-
-async function listDir(dir) {
-  if (!GH_OWNER) throw new Error("Manifest unavailable (UPSTREAM_BASE not raw.github...)");
-  const key = `__index__/${dir}`;
-  const now = Date.now();
-  const cached = memoryCache.get(key);
-  const TTL_MS = 24 * 60 * 60 * 1000;
-  if (cached && now - cached.fetchedAt < TTL_MS) return cached.body;
-
-  const api = `https://api.github.com/repos/${GH_OWNER}/${GH_REPO}/contents/${GH_BASEPATH}/${dir}?ref=${encodeURIComponent(GH_BRANCH)}`;
-  const headers = { Accept: "application/vnd.github+json", "User-Agent": "crt-items-proxy" };
-  if (GITHUB_TOKEN) headers.Authorization = `Bearer ${GITHUB_TOKEN}`;
-
-  const r = await fetchWithRetry(api, { headers }, { attempts: 2, timeoutMs: 5000 });
-  if (!r.ok) throw new Error(`GitHub list error ${r.status}: ${await r.text()}`);
-  const json = await r.json();
-
-  const files = Array.isArray(json)
-    ? json.filter(x => x.type === "file" && /\.json$/i.test(x.name)).map(x => x.name.replace(/\.json$/i, "")).sort()
-    : [];
-
-  const body = { dir, count: files.length, files };
-  memoryCache.set(key, { body, fetchedAt: now });
-  return body;
-}
-
-// Common handler used by routes
-
-// ADD ABOVE the /docs/commit-bulk route (place near other helpers)
-async function buildFilesFromTrigger(trigger) {
-  // trigger: { add_post, canonical_base, images_link?, allow_urls?[] }
-  if (!trigger || !trigger.add_post) {
-    const e = new Error("trigger.add_post required"); e.code = 400; throw e;
-  }
-  const addUrl = String(trigger.add_post).trim();
-  if (!/^https:\/\/raw\.githubusercontent\.com\//i.test(addUrl)) {
-    const e = new Error("add_post must be raw.githubusercontent.com"); e.code = 400; throw e;
-  }
-
-  // Fetch the post JSON
-  const postResp = await fetchWithRetry(addUrl, {}, { attempts: 2, timeoutMs: 6000 });
-  if (!postResp.ok) { const t = await postResp.text(); const e = new Error(`add_post fetch ${postResp.status}: ${t}`); e.code = 400; throw e; }
-  const postJson = await postResp.json();
-
-  // Parse venue/year/slug from filename + parent folder
-  // Expect: .../docs/blogs/{venue}-blogs-{year}/{slug}/{slug}.json
-  const m = addUrl.match(/\/docs\/blogs\/([^/]+)-blogs-(\d{4})\/([^/]+)\/\3\.json$/i);
-  if (!m) { const e = new Error("add_post path does not match expected blog structure"); e.code = 400; throw e; }
-  const venue = m[1], year = m[2], slug = m[3];
-
-  // Derive canonical + paths
-  const canonicalBase = String(trigger.canonical_base || "https://blog.clearroundtravel.com").replace(/\/+$/,"");
-  const postPath = `docs/blogs/${venue}-blogs-${year}/${slug}/`;
-  const jsonRel  = `${postPath}${slug}.json`;
-  const indexRel = `${postPath}index.html`;
-  const manifestRel = `docs/blogs/manifest.json`;
-  const rssRel = `docs/blogs/rss.xml`;
-  const sitemapRel = `docs/sitemap.xml`;
-
-  // Read existing manifest
-  let manifest = [];
-  try {
-    const manUrl = `${UPSTREAM_BASE.replace(/\/+$/,"")}/${manifestRel}`;
-    const manResp = await fetchWithRetry(manUrl, {}, { attempts: 2, timeoutMs: 5000 });
-    if (manResp.ok) manifest = await manResp.json();
-  } catch {}
-  if (!Array.isArray(manifest)) manifest = [];
-
-  // Compute minimal fields
-  const title = postJson?.seo?.section_title || postJson?.seo?.open_graph_title || slug;
-  // prefer filename date in slug: {venue}-blog-YYYY-MM-DD
-  const dateMatch = slug.match(/-(\d{4}-\d{2}-\d{2})$/);
-  const date = dateMatch ? dateMatch[1] : (postJson?.meta?.timestamp_iso || "").slice(0,10);
-  const month_num = date ? date.slice(5,7) : "";
-  const month_name = month_num ? ["","January","February","March","April","May","June","July","August","September","October","November","December"][parseInt(month_num,10)] : "";
-  const season = (() => {
-    const m = parseInt(month_num||"0",10);
-    if (m===12||m===1||m===2) return "winter";
-    if (m>=3 && m<=5) return "spring";
-    if (m>=6 && m<=8) return "summer";
-    if (m>=9 && m<=11) return "fall";
-    return "";
-  })();
-
-  // Optional images_link for card image
-  let card_image = "/assets/images/card-placeholder.jpg";
-  if (trigger.images_link) {
-    try {
-      const imgResp = await fetchWithRetry(trigger.images_link, {}, { attempts: 2, timeoutMs: 5000 });
-      if (imgResp.ok) {
-        const imgs = await imgResp.json();
-        if (imgs?.card_image_link) card_image = imgs.card_image_link;
-      }
-    } catch {}
-  }
-
-  // Upsert manifest entry
-  const pathPublic = `/blogs/${venue}-blogs-${year}/${slug}/`;
-  const jsonPublic = `/${jsonRel.replace(/^docs\//,"")}`;
-  const entry = {
-    slug, title, date,
-    year, month_num, month_name, season,
-    path: pathPublic,
-    json: jsonPublic,
-    image: card_image,
-    venue,
-  };
-  const idx = manifest.findIndex(x => x.slug === slug);
-  if (idx >= 0) manifest[idx] = { ...manifest[idx], ...entry };
-  else manifest.push(entry);
-
-  // Minimal index.html placeholder (does NOT overwrite the JSON)
-  const html = [
-    "<!doctype html>",
-    "<html><head>",
-    `<meta charset="utf-8"><title>${title}</title>`,
-    `<link rel="canonical" href="${canonicalBase}${pathPublic}">`,
-    `<meta name="viewport" content="width=device-width,initial-scale=1">`,
-    "</head><body>",
-    `<main><h1>${title}</h1>`,
-    `<p>Post shell for <code>${slug}</code>. Body JSON lives at <a href="/${jsonRel.replace(/^docs\//,"")}">${slug}.json</a>.</p>`,
-    `<p>This placeholder exists so Structure Runner templates can hydrate later.</p>`,
-    `<nav><a href="/blogs/">All blogs</a></nav>`,
-    "</main>",
-    "</body></html>\n"
-  ].join("");
-
-  // Rebuild RSS and sitemap very simply (placeholders; your full templates will replace)
-  const rss = `<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel><title>Blog RSS</title>${manifest
-    .slice()
-    .sort((a,b)=>String(b.date).localeCompare(a.date))
-    .slice(0,20)
-    .map(it=>`<item><title>${it.title}</title><link>${canonicalBase}${it.path}</link><pubDate>${it.date}</pubDate></item>`).join("")}</channel></rss>\n`;
-
-  const smUrls = [
-    `${canonicalBase}/blogs/`,
-    ...manifest.map(it => `${canonicalBase}${it.path}`)
-  ];
-  const sitemap = `<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${smUrls.map(u=>`<url><loc>${u}</loc></url>`).join("")}</urlset>\n`;
-
-  // Build basic /blogs/ and /blogs/{year}/ indexes from manifest (until templates hydrate)
-  const bySeason = (list) => ({
-    winter: list.filter(x => x.season === "winter"),
-    spring: list.filter(x => x.season === "spring"),
-    summer: list.filter(x => x.season === "summer"),
-    fall:   list.filter(x => x.season === "fall"),
-  });
-
-  const renderCards = (items) => items.map(it => `
-    <article class="card">
-      <a href="${it.path}">
-        <img loading="lazy" src="${it.image || "/assets/images/card-placeholder.jpg"}" alt="${(it.title||"").replace(/"/g,"&quot;")}">
-        <h3>${it.title || it.slug}</h3>
-        <p>${it.date || ""}</p>
-      </a>
-    </article>`).join("");
-
-  const renderSection = (label, items) => items.length ? `
-    <section class="section">
-      <header><h2>${label}</h2><a class="see-all" href="/blogs/?season=${label.toLowerCase()}">See all &rsaquo;</a></header>
-      <div class="carousel">${renderCards(items)}</div>
-    </section>` : "";
-
-  const styles = `
-    <style>
-      body{margin:0;background:#111315;color:#f1f1f1;font-family:system-ui,"Segoe UI",sans-serif}
-      main{max-width:1100px;margin:0 auto;padding:40px 20px}
-      .section{margin:28px 0}
-      .section header{display:flex;justify-content:space-between;align-items:center;margin-bottom:12px}
-      .carousel{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(230px,1fr);gap:16px;overflow-x:auto;padding-bottom:6px}
-      .card{background:#1a1d1f;border-radius:16px;box-shadow:0 0 0 1px rgba(255,255,255,.06) inset}
-      .card img{width:100%;height:148px;object-fit:cover;border-top-left-radius:16px;border-top-right-radius:16px;display:block}
-      .card h3{font-size:16px;margin:10px 12px 6px}
-      .card p{font-size:13px;color:#a0a0a0;margin:0 12px 12px}
-      a{color:#8bb7ff;text-decoration:none}
-      .see-all{font-size:14px;color:#a0c4ff}
-      nav.breadcrumbs{max-width:1100px;margin:0 auto;padding:12px 20px;color:#a0a0a0;font-size:14px}
-      .sr-only{position:absolute;left:-9999px}
-    </style>
-  `;
-
-  const allSorted = manifest.slice().sort((a,b)=>String(b.date).localeCompare(a.date));
-  const seasonsAll = bySeason(allSorted);
-  const blogsIndexHtml = `<!doctype html><html><head><meta charset="utf-8">
-    <title>Blogs</title><meta name="viewport" content="width=device-width,initial-scale=1">${styles}</head>
-    <body><nav class="breadcrumbs">Home / Blogs</nav><main>
-      ${renderSection("Fall",   seasonsAll.fall)}
-      ${renderSection("Summer", seasonsAll.summer)}
-      ${renderSection("Spring", seasonsAll.spring)}
-      ${renderSection("Winter", seasonsAll.winter)}
-    </main></body></html>\n`;
-
-  const yearList = allSorted.filter(x => x.year === year);
-  const seasonsYear = bySeason(yearList);
-  const yearIndexHtml = `<!doctype html><html><head><meta charset="utf-8">
-    <title>Blogs ${year}</title><meta name="viewport" content="width=device-width,initial-scale=1">${styles}</head>
-    <body><nav class="breadcrumbs">Home / Blogs / ${year}</nav><main>
-      ${renderSection("Fall",   seasonsYear.fall)}
-      ${renderSection("Summer", seasonsYear.summer)}
-      ${renderSection("Spring", seasonsYear.spring)}
-      ${renderSection("Winter", seasonsYear.winter)}
-    </main></body></html>\n`;
-
-  // Return files[] for bulk commit
-  const enc = (s) => Buffer.from(s, "utf8").toString("base64");
-  return {
-    message: `chore: scaffold ${slug}`,
-    overwrite: true,
-    files: [
-      { path: indexRel,                 content_type: "text/html",        content_base64: enc(html) },
-      { path: manifestRel,              content_type: "application/json", content_base64: enc(JSON.stringify(manifest, null, 2) + "\n") },
-      { path: rssRel,                   content_type: "application/xml",  content_base64: enc(rss) },
-      { path: sitemapRel,               content_type: "application/xml",  content_base64: enc(sitemap) },
-      { path: "docs/blogs/index.html",  content_type: "text/html",        content_base64: enc(blogsIndexHtml) },
-      { path: `docs/blogs/${year}/index.html`, content_type: "text/html", content_base64: enc(yearIndexHtml) }
-      // NOTE: we DO NOT include the post JSON; never overwrite add_post payload.
-    ]
-  };
-
-}
-
+// Common handler used by /items/* proxy routes
 async function handleItems(req, res, { head = false } = {}) {
   const rel = (req.params[0] || "").trim();
   if (!isAllowedPath(rel)) return res.status(400).end(head ? "" : JSON.stringify({ error: "Bad path" }));
@@ -483,16 +187,19 @@ async function handleItems(req, res, { head = false } = {}) {
   }
 }
 
-// Middleware (keep before routes)
-// Middleware (keep before routes)
+// --- Middleware ---
 app.use(morgan("combined"));
-app.use(cors({ origin: "*" }));
+app.use(cors({
+  origin: (origin, cb) => {
+    // allow no-origin (curl/Postman) and any explicitly allowed origins
+    if (!origin || ALLOW_ORIGINS.has(origin)) return cb(null, true);
+    return cb(null, false);
+  }
+}));
 app.options("*", cors()); // handle preflight
-app.use(express.json());
+app.use(express.json({ limit: "2mb" })); // JSON bodies
 
-
-
-// --- HEAD then GET for /items/* ---
+// --- HEAD then GET for /items/* (proxy read)
 app.head("/items/*", async (req, res) => {
   try { await handleItems(req, res, { head: true }); }
   catch (err) { console.error("HEAD proxy error:", err); res.status(500).end(); }
@@ -504,6 +211,7 @@ app.get("/items/*", async (req, res) => {
 });
 
 // --- GitHub commit endpoint (supports .json + text files) ---
+// KEEP: Airtable depends on this route
 app.post("/items/commit", async (req, res) => {
   try {
     let { path: p, json, message } = req.body;
@@ -524,9 +232,9 @@ app.post("/items/commit", async (req, res) => {
       if (!contentStr.endsWith("\n")) contentStr += "\n";
     }
 
-    const repo = process.env.GITHUB_REPO;
-    const branch = process.env.GITHUB_BRANCH || "main";
-    const token = process.env.GITHUB_TOKEN;
+    const repo = GITHUB_REPO;
+    const branch = GITHUB_BRANCH;
+    const token = GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
     const repoPath = `items/${rel}`;
@@ -545,14 +253,15 @@ app.post("/items/commit", async (req, res) => {
     if (!put.ok) return res.status(put.status).json(result);
 
     memoryCache.delete(rel);
-
     res.json({ ok: true, path: repoPath, commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url } });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Commit failed" });
   }
 });
-// --- /docs/commit (JSON-only single-file commit)
+
+// --- /docs/commit (JSON-only single-file commit) ---
+// KEEP: Airtable + runners depend on this route
 app.post("/docs/commit", async (req, res) => {
   try {
     let { path: p, json, message } = req.body || {};
@@ -563,9 +272,9 @@ app.post("/docs/commit", async (req, res) => {
     let rel = String(p).trim().replace(/^\/+/, "").replace(/^docs\//, "");
     if (!/\.json$/i.test(rel)) return res.status(400).json({ error: "Docs commits require a .json file path" });
 
-    const repo   = process.env.GITHUB_REPO;
-    const branch = process.env.GITHUB_BRANCH || "main";
-    const token  = process.env.GITHUB_TOKEN;
+    const repo   = GITHUB_REPO;
+    const branch = GITHUB_BRANCH;
+    const token  = GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
     // stringify JSON payload
@@ -597,28 +306,18 @@ app.post("/docs/commit", async (req, res) => {
   }
 });
 
-// --- /docs/commit (mirror of /items/commit but forces docs/ and JSON only)
-// REPLACE the /docs/commit-bulk route with this updated version (lines before/after kept)
+// --- /docs/commit-bulk (single Git commit for multiple docs/* files; accepts .html, .xml, .json) ---
+// KEEP: runners depend on this route; no trigger/render logic here
 app.post("/docs/commit-bulk", async (req, res) => {
   try {
-    let { message, overwrite, files, trigger, add_post, canonical_base, images_link, allow_urls } = req.body || {};
-
-    // NEW: accept trigger payload either under `trigger` or top-level fields
-    if (!files && (trigger || add_post)) {
-      const trig = trigger || { add_post, canonical_base, images_link, allow_urls };
-      const built = await buildFilesFromTrigger(trig);
-      message = built.message;
-      overwrite = built.overwrite;
-      files = built.files;
-    }
-
+    const { message, overwrite, files } = req.body || {};
     if (!Array.isArray(files) || files.length === 0) {
-      return res.status(400).json({ error: "files[] required or provide trigger.add_post" });
+      return res.status(400).json({ error: "files[] required" });
     }
 
-    const repo   = process.env.GITHUB_REPO;
-    const branch = process.env.GITHUB_BRANCH || "main";
-    const token  = process.env.GITHUB_TOKEN;
+    const repo   = GITHUB_REPO;
+    const branch = GITHUB_BRANCH;
+    const token  = GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
     // Validate files
@@ -697,19 +396,22 @@ app.post("/docs/commit-bulk", async (req, res) => {
 
     // Invalidate simple cache entries
     for (const f of norm) {
-      memoryCache.delete(f.path);
-      memoryCache.delete(f.path.replace(/^docs\//, ""));
+      memoryCache.delete(f.path);                         // exact docs/… key
+      memoryCache.delete(f.path.replace(/^docs\//, ""));  // fallback variant
     }
 
     const committed_paths = norm.map(f => f.path);
     const htmlUrl = commitPostJson.html_url || `https://github.com/${repo}/commit/${newCommitSha}`;
-    return res.status(200).json({ ok: true, commit: { sha: newCommitSha, url: htmlUrl }, committed_paths });
+    return res.status(200).json({
+      ok: true,
+      commit: { sha: newCommitSha, url: htmlUrl },
+      committed_paths
+    });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ error: e.message || "bulk commit failed" });
   }
 });
-
 
 // GET /docs/* -> proxy-read from upstream repo (raw)
 app.get("/docs/*", async (req, res) => {
@@ -739,10 +441,12 @@ app.get("/docs/*", async (req, res) => {
   }
 });
 
-
-
 // boot
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
+  console.log(`[startup] UPSTREAM_BASE='${UPSTREAM_BASE}'`);
+  console.log(`[startup] ALLOW_DIRS=${Array.from(ALLOW_DIRS).join(",")}`);
+  console.log(`[startup] ALLOW_ORIGINS=${Array.from(ALLOW_ORIGINS).join(",")}`);
+  console.log(`[startup] ALLOW_UPSTREAM_HOSTS=${Array.from(ALLOW_UPSTREAM_HOSTS).join(",")}`);
   console.log(`CRT items proxy running on ${PORT}`);
 });
