@@ -1,4 +1,4 @@
-// server.js — minimal proxy + commit APIs (older commit routes restored; permissive CORS)
+// server.js — minimal proxy + commit APIs (older commit routes + alias for /items/)
 
 // Core imports
 const express = require("express");
@@ -189,9 +189,9 @@ async function handleItems(req, res, { head = false } = {}) {
 
 // --- Middleware (older behavior: permissive CORS) ---
 app.use(morgan("combined"));
-app.use(cors({ origin: "*" }));                 // <— restored
-app.options("*", cors());                       // keep preflight
-app.use(express.json({ limit: "2mb" }));        // JSON bodies
+app.use(cors({ origin: "*" }));
+app.options("*", cors());
+app.use(express.json({ limit: "2mb" }));
 
 // --- HEAD then GET for /items/* (proxy read)
 app.head("/items/*", async (req, res) => {
@@ -204,8 +204,7 @@ app.get("/items/*", async (req, res) => {
   catch (err) { console.error("Proxy error:", err); res.status(500).json({ error: "Proxy failed" }); }
 });
 
-// --- GitHub commit endpoint (RESTORED: older route body) ---
-// Airtable depends on this route
+// --- GitHub commit endpoint (RESTORED) ---
 app.post("/items/commit", async (req, res) => {
   try {
     let { path, json, message } = req.body;
@@ -213,30 +212,24 @@ app.post("/items/commit", async (req, res) => {
       return res.status(400).json({ error: "path and json required" });
     }
 
-    // Normalize path: accept "items/..." or bare "...", strip leading slashes
     let rel = String(path).replace(/^\/+/, "").replace(/^items\//, "");
-
-    // Validate target path (dir+ext must be allowed)
     if (!isAllowedPath(rel)) return res.status(400).json({ error: "Path not allowed" });
 
     const isJson = /\.json$/i.test(rel);
-    // For non-.json files, require the client to send a string (the file body)
     if (!isJson && typeof json !== "string") {
       return res.status(400).json({ error: "For text files, json must be a string body" });
     }
 
-    const repo = GITHUB_REPO;             // e.g. "sportdogfood/clear-round-datasets"
+    const repo = GITHUB_REPO;
     const branch = GITHUB_BRANCH;
     const token = GITHUB_TOKEN;
     if (!repo || !token) {
       return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
     }
 
-    // Compute content string based on extension
     let contentStr;
     if (isJson) {
       try {
-        // If client provided a string, parse it first so we pretty-print consistently
         contentStr = JSON.stringify(
           typeof json === "string" ? JSON.parse(json) : json,
           null,
@@ -246,12 +239,10 @@ app.post("/items/commit", async (req, res) => {
         return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` });
       }
     } else {
-      // Normalize text files for clean diffs: LF newlines, ensure trailing newline
       contentStr = String(json).replace(/\r\n?/g, "\n");
       if (!contentStr.endsWith("\n")) contentStr += "\n";
     }
 
-    // Prepare GitHub API call
     const repoPath = `items/${rel}`;
     const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
     const headers = {
@@ -260,7 +251,6 @@ app.post("/items/commit", async (req, res) => {
       "User-Agent": "crt-items-proxy"
     };
 
-    // Fetch existing SHA (if any)
     let sha;
     const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
     if (head.ok) {
@@ -279,7 +269,6 @@ app.post("/items/commit", async (req, res) => {
     const result = await put.json();
     if (!put.ok) return res.status(put.status).json(result);
 
-    // Bust proxy cache (GET path key)
     memoryCache.delete(rel);
 
     res.json({
@@ -293,15 +282,19 @@ app.post("/items/commit", async (req, res) => {
   }
 });
 
-// --- /docs/commit (JSON-only single-file commit) ---
-// KEEP as-is (used by Airtable/runners)
+// --- Compat alias: POST /items/ and /items -> same as /items/commit (no refactor, exact behavior)
+app.post(["/items", "/items/"], async (req, res, next) => {
+  req.url = "/items/commit";           // hand off to the existing handler
+  next();
+}, app._router.stack.find(l => l.route && l.route.path === "/items/commit").route.stack[0].handle);
+
+// --- /docs/commit (JSON-only single-file commit)
 app.post("/docs/commit", async (req, res) => {
   try {
     let { path: p, json, message } = req.body || {};
     if (!p || json === undefined || json === null) {
       return res.status(400).json({ error: "path and json required" });
     }
-    // normalize + enforce docs/
     let rel = String(p).trim().replace(/^\/+/, "").replace(/^docs\//, "");
     if (!/\.json$/i.test(rel)) return res.status(400).json({ error: "Docs commits require a .json file path" });
 
@@ -310,7 +303,6 @@ app.post("/docs/commit", async (req, res) => {
     const token  = GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
-    // stringify JSON payload
     let contentStr;
     try { contentStr = JSON.stringify(typeof json === "string" ? JSON.parse(json) : json, null, 2) + "\n"; }
     catch (e) { return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` }); }
@@ -319,7 +311,6 @@ app.post("/docs/commit", async (req, res) => {
     const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
     const headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "crt-docs-proxy" };
 
-    // existing SHA
     let sha;
     const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
     if (head.ok) { const meta = await head.json(); sha = meta.sha; }
@@ -339,8 +330,7 @@ app.post("/docs/commit", async (req, res) => {
   }
 });
 
-// --- /docs/commit-bulk (single Git commit for multiple docs/* files; accepts .html, .xml, .json) ---
-// KEEP as-is (runner depends on this route)
+// --- /docs/commit-bulk (single commit for multiple docs/* files)
 app.post("/docs/commit-bulk", async (req, res) => {
   try {
     const { message, overwrite, files } = req.body || {};
@@ -353,7 +343,6 @@ app.post("/docs/commit-bulk", async (req, res) => {
     const token  = GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
-    // Validate files
     const allowedExt = /\.(html|xml|json)$/i;
     const norm = files.map((f, i) => {
       const p = String(f.path || "").trim().replace(/^\/+/, "");
@@ -365,7 +354,6 @@ app.post("/docs/commit-bulk", async (req, res) => {
       return { path: p, b64: content_base64 };
     });
 
-    // GitHub API helpers
     const gh = async (url, opts = {}, attempts = 2, timeoutMs = 7000) => {
       const headers = {
         Authorization: `Bearer ${token}`,
@@ -376,7 +364,6 @@ app.post("/docs/commit-bulk", async (req, res) => {
       return fetchWithRetry(url, { ...opts, headers }, { attempts, timeoutMs });
     };
 
-    // Resolve refs and base tree
     const refUrl = `https://api.github.com/repos/${repo}/git/refs/heads/${encodeURIComponent(branch)}`;
     const refResp = await gh(refUrl);
     if (!refResp.ok) return res.status(refResp.status).json({ error: `ref ${refResp.status}` });
@@ -390,7 +377,6 @@ app.post("/docs/commit-bulk", async (req, res) => {
     const baseTreeSha = commitJson.tree?.sha;
     if (!baseTreeSha) return res.status(500).json({ error: "Missing base tree sha" });
 
-    // Create blobs
     const blobShas = [];
     for (const f of norm) {
       const blobResp = await gh(`https://api.github.com/repos/${repo}/git/blobs`, {
@@ -402,7 +388,6 @@ app.post("/docs/commit-bulk", async (req, res) => {
       blobShas.push({ path: f.path, sha: blobJson.sha });
     }
 
-    // Create tree
     const tree = blobShas.map(x => ({ path: x.path, mode: "100644", type: "blob", sha: x.sha }));
     const treeResp = await gh(`https://api.github.com/repos/${repo}/git/trees`, {
       method: "POST",
@@ -412,7 +397,6 @@ app.post("/docs/commit-bulk", async (req, res) => {
     if (!treeResp.ok) return res.status(treeResp.status).json({ error: `tree ${treeResp.status}`, details: treeJson });
     const newTreeSha = treeJson.sha;
 
-    // Create commit
     const msg = message || "chore: docs bulk update";
     const commitPost = await gh(`https://api.github.com/repos/${repo}/git/commits`, {
       method: "POST",
@@ -422,15 +406,13 @@ app.post("/docs/commit-bulk", async (req, res) => {
     if (!commitPost.ok) return res.status(commitPost.status).json({ error: `commit-post ${commitPost.status}`, details: commitPostJson });
     const newCommitSha = commitPostJson.sha;
 
-    // Update ref
     const refPatch = await gh(refUrl, { method: "PATCH", body: JSON.stringify({ sha: newCommitSha, force: !!overwrite }) });
     const refPatchJson = await refPatch.json();
     if (!refPatch.ok) return res.status(refPatch.status).json({ error: `ref-patch ${refPatch.status}`, details: refPatchJson });
 
-    // Invalidate simple cache entries
     for (const f of norm) {
-      memoryCache.delete(f.path);                         // exact docs/… key
-      memoryCache.delete(f.path.replace(/^docs\//, ""));  // fallback variant
+      memoryCache.delete(f.path);
+      memoryCache.delete(f.path.replace(/^docs\//, ""));
     }
 
     const committed_paths = norm.map(f => f.path);
@@ -449,7 +431,6 @@ app.post("/docs/commit-bulk", async (req, res) => {
 // GET /docs/* -> proxy-read from upstream repo (raw)
 app.get("/docs/*", async (req, res) => {
   try {
-    // normalize and enforce docs/
     const relParam = String(req.params[0] || "").trim().replace(/^\/+/, "");
     const clean = relParam.replace(/^docs\//, "");
     const repoPath = `docs/${clean}`;
