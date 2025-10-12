@@ -306,6 +306,50 @@ app.post("/docs/commit", async (req, res) => {
   }
 });
 
+// --- helpers for /docs/commit-bulk validation ---
+const REQ_PATTERNS = {
+  publish_json:   /^docs\/blogs\/[^/]+-blogs-\d{4}\/[^/]+\/[^/]+-publish-\d{4}-\d{2}-\d{2}\.json$/i,
+  post_index:     /^docs\/blogs\/[^/]+-blogs-\d{4}\/[^/]+\/index\.html$/i,
+  blogs_index:    /^docs\/blogs\/index\.html$/i,
+  year_index:     /^docs\/blogs\/\d{4}\/index\.html$/i,
+  rss_xml:        /^docs\/blogs\/rss\.xml$/i,
+  sitemap_xml:    /^docs\/sitemap\.xml$/i,
+  manifest_json:  /^docs\/blogs\/manifest\.json$/i
+};
+
+const MIN_BYTES = {
+  publish_json: 100,
+  post_index:   200,
+  blogs_index:  200,
+  year_index:   200,
+  rss_xml:      80,
+  sitemap_xml:  80,
+  manifest_json:50
+};
+
+const DENY_BLOG_SRC_RE = /-blog-\d{4}-\d{2}-\d{2}\.json$/i;
+
+function roleForPath(p) {
+  for (const [role, rx] of Object.entries(REQ_PATTERNS)) {
+    if (rx.test(p)) return role;
+  }
+  return null;
+}
+
+function decodeBase64Strict(b64) {
+  const clean = String(b64).trim().replace(/\s+/g, "");
+  // Quick sanity: base64 alphabet + padding
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(clean)) return { ok: false, reason: "invalid_base64_chars", bytes: 0, buf: null };
+  try {
+    const buf = Buffer.from(clean, "base64");
+    // Reject obviously empty decodes
+    if (!buf || buf.length === 0) return { ok: false, reason: "decoded_zero_bytes", bytes: 0, buf: null };
+    return { ok: true, bytes: buf.length, buf };
+  } catch (e) {
+    return { ok: false, reason: "base64_decode_error", bytes: 0, buf: null };
+  }
+}
+
 // --- /docs/commit-bulk (single Git commit for multiple docs/* files; accepts .html, .xml, .json) ---
 // KEEP: runners depend on this route; no trigger/render logic here
 app.post("/docs/commit-bulk", async (req, res) => {
@@ -320,7 +364,7 @@ app.post("/docs/commit-bulk", async (req, res) => {
     const token  = GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
-    // Validate files
+    // Normalize + basic shape
     const allowedExt = /\.(html|xml|json)$/i;
     const norm = files.map((f, i) => {
       const p = String(f.path || "").trim().replace(/^\/+/, "");
@@ -329,8 +373,58 @@ app.post("/docs/commit-bulk", async (req, res) => {
       if (!allowedExt.test(p)) throw new Error(`Disallowed extension at index ${i}`);
       const content_base64 = String(f.content_base64 || "");
       if (!content_base64) throw new Error(`Missing content_base64 at index ${i}`);
-      return { path: p, b64: content_base64 };
+      return { path: p, b64: content_base64, content_type: f.content_type || "" };
     });
+
+    // --- Validation Gate (x-validate parity) ---
+    const errors = [];
+    const roleHits = {}; // role -> {path, bytes}
+    const unexpected = [];
+
+    // Deny any attempt to write source *-blog-YYYY-MM-DD.json
+    for (const f of norm) {
+      if (DENY_BLOG_SRC_RE.test(f.path)) {
+        errors.push({ path: f.path, reason: "write_to_source_blog_json_forbidden" });
+      }
+    }
+
+    // Decode, size-check, role matching
+    for (const f of norm) {
+      const dec = decodeBase64Strict(f.b64);
+      if (!dec.ok) {
+        errors.push({ path: f.path, reason: dec.reason, decoded_bytes: dec.bytes, min_required: 1 });
+        continue;
+      }
+      const role = roleForPath(f.path);
+      if (!role) {
+        unexpected.push({ path: f.path, reason: "path_not_in_allowlist" });
+        continue;
+      }
+      // Keep the largest (shouldn't duplicate roles, but guard anyway)
+      if (!roleHits[role] || dec.bytes > roleHits[role].bytes) {
+        roleHits[role] = { path: f.path, bytes: dec.bytes };
+      }
+    }
+
+    // Required roles presence + min-bytes thresholds
+    for (const [role, min] of Object.entries(MIN_BYTES)) {
+      if (!roleHits[role]) {
+        errors.push({ role, reason: "required_path_missing", expected_pattern: String(REQ_PATTERNS[role]) });
+      } else if (roleHits[role].bytes < min) {
+        errors.push({ path: roleHits[role].path, reason: "below_min_bytes", decoded_bytes: roleHits[role].bytes, min_required: min });
+      }
+    }
+
+    // Unexpected paths (not matching any allowed pattern)
+    for (const u of unexpected) errors.push(u);
+
+    if (errors.length > 0) {
+      return res.status(400).json({
+        error: "validation_failed",
+        details: errors
+      });
+    }
+    // --- End Validation Gate ---
 
     // GitHub API helpers
     const gh = async (url, opts = {}, attempts = 2, timeoutMs = 7000) => {
@@ -450,3 +544,4 @@ app.listen(PORT, () => {
   console.log(`[startup] ALLOW_UPSTREAM_HOSTS=${Array.from(ALLOW_UPSTREAM_HOSTS).join(",")}`);
   console.log(`CRT items proxy running on ${PORT}`);
 });
+
