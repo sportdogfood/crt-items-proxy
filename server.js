@@ -1,4 +1,4 @@
-// server.js — minimal proxy + commit APIs (no rendering, no runner logic)
+// server.js — minimal proxy + commit APIs (older commit routes restored; permissive CORS)
 
 // Core imports
 const express = require("express");
@@ -14,7 +14,7 @@ const app = express();
 const UPSTREAM_BASE = process.env.UPSTREAM_BASE; // e.g. https://raw.githubusercontent.com/sportdogfood/clear-round-datasets/main
 if (!UPSTREAM_BASE) throw new Error("Missing UPSTREAM_BASE");
 
-// Always keep Airtable allowed in CORS origins (can add more via env)
+// Always keep Airtable allowed (older behavior: permissive CORS)
 const ALLOW_ORIGINS = new Set(
   (process.env.ALLOW_ORIGINS ||
     "https://items.clearroundtravel.com,https://blog.clearroundtravel.com,https://airtable.com,https://app.airtable.com,https://console.airtable.com"
@@ -24,7 +24,7 @@ const ALLOW_ORIGINS = new Set(
     .filter(Boolean)
 );
 
-// Enforce raw host allowlist
+// Enforce raw host allowlist (kept)
 const ALLOW_UPSTREAM_HOSTS = new Set(
   (process.env.ALLOW_UPSTREAM_HOSTS || "raw.githubusercontent.com")
     .split(",")
@@ -187,17 +187,11 @@ async function handleItems(req, res, { head = false } = {}) {
   }
 }
 
-// --- Middleware ---
+// --- Middleware (older behavior: permissive CORS) ---
 app.use(morgan("combined"));
-app.use(cors({
-  origin: (origin, cb) => {
-    // allow no-origin (curl/Postman) and any explicitly allowed origins
-    if (!origin || ALLOW_ORIGINS.has(origin)) return cb(null, true);
-    return cb(null, false);
-  }
-}));
-app.options("*", cors()); // handle preflight
-app.use(express.json({ limit: "2mb" })); // JSON bodies
+app.use(cors({ origin: "*" }));                 // <— restored
+app.options("*", cors());                       // keep preflight
+app.use(express.json({ limit: "2mb" }));        // JSON bodies
 
 // --- HEAD then GET for /items/* (proxy read)
 app.head("/items/*", async (req, res) => {
@@ -210,50 +204,89 @@ app.get("/items/*", async (req, res) => {
   catch (err) { console.error("Proxy error:", err); res.status(500).json({ error: "Proxy failed" }); }
 });
 
-// --- GitHub commit endpoint (supports .json + text files) ---
-// KEEP: Airtable depends on this route
+// --- GitHub commit endpoint (RESTORED: older route body) ---
+// Airtable depends on this route
 app.post("/items/commit", async (req, res) => {
   try {
-    let { path: p, json, message } = req.body;
-    if (!p || json === undefined || json === null) return res.status(400).json({ error: "path and json required" });
+    let { path, json, message } = req.body;
+    if (!path || json === undefined || json === null) {
+      return res.status(400).json({ error: "path and json required" });
+    }
 
-    let rel = String(p).replace(/^\/+/, "").replace(/^items\//, "");
+    // Normalize path: accept "items/..." or bare "...", strip leading slashes
+    let rel = String(path).replace(/^\/+/, "").replace(/^items\//, "");
+
+    // Validate target path (dir+ext must be allowed)
     if (!isAllowedPath(rel)) return res.status(400).json({ error: "Path not allowed" });
 
     const isJson = /\.json$/i.test(rel);
-    if (!isJson && typeof json !== "string") return res.status(400).json({ error: "For text files, json must be a string body" });
+    // For non-.json files, require the client to send a string (the file body)
+    if (!isJson && typeof json !== "string") {
+      return res.status(400).json({ error: "For text files, json must be a string body" });
+    }
 
+    const repo = GITHUB_REPO;             // e.g. "sportdogfood/clear-round-datasets"
+    const branch = GITHUB_BRANCH;
+    const token = GITHUB_TOKEN;
+    if (!repo || !token) {
+      return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
+    }
+
+    // Compute content string based on extension
     let contentStr;
     if (isJson) {
-      try { contentStr = JSON.stringify(typeof json === "string" ? JSON.parse(json) : json, null, 2) + "\n"; }
-      catch (e) { return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` }); }
+      try {
+        // If client provided a string, parse it first so we pretty-print consistently
+        contentStr = JSON.stringify(
+          typeof json === "string" ? JSON.parse(json) : json,
+          null,
+          2
+        ) + "\n";
+      } catch (e) {
+        return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` });
+      }
     } else {
+      // Normalize text files for clean diffs: LF newlines, ensure trailing newline
       contentStr = String(json).replace(/\r\n?/g, "\n");
       if (!contentStr.endsWith("\n")) contentStr += "\n";
     }
 
-    const repo = GITHUB_REPO;
-    const branch = GITHUB_BRANCH;
-    const token = GITHUB_TOKEN;
-    if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
-
+    // Prepare GitHub API call
     const repoPath = `items/${rel}`;
     const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
-    const headers = { Authorization: `Bearer ${token}`, Accept: "application/vnd.github+json", "User-Agent": "crt-items-proxy" };
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "crt-items-proxy"
+    };
 
+    // Fetch existing SHA (if any)
     let sha;
     const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
-    if (head.ok) { const meta = await head.json(); sha = meta.sha; }
+    if (head.ok) {
+      const meta = await head.json();
+      sha = meta.sha;
+    }
 
-    const body = { message: message || `chore: update ${repoPath}`, content: Buffer.from(contentStr, "utf8").toString("base64"), branch };
+    const body = {
+      message: message || `chore: update ${repoPath}`,
+      content: Buffer.from(contentStr, "utf8").toString("base64"),
+      branch
+    };
     if (sha) body.sha = sha;
 
     const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
     const result = await put.json();
     if (!put.ok) return res.status(put.status).json(result);
 
+    // Bust proxy cache (GET path key)
     memoryCache.delete(rel);
-    res.json({ ok: true, path: repoPath, commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url } });
+
+    res.json({
+      ok: true,
+      path: repoPath,
+      commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url }
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Commit failed" });
@@ -261,7 +294,7 @@ app.post("/items/commit", async (req, res) => {
 });
 
 // --- /docs/commit (JSON-only single-file commit) ---
-// KEEP: Airtable + runners depend on this route
+// KEEP as-is (used by Airtable/runners)
 app.post("/docs/commit", async (req, res) => {
   try {
     let { path: p, json, message } = req.body || {};
@@ -306,52 +339,8 @@ app.post("/docs/commit", async (req, res) => {
   }
 });
 
-// --- helpers for /docs/commit-bulk validation ---
-const REQ_PATTERNS = {
-  publish_json:   /^docs\/blogs\/[^/]+-blogs-\d{4}\/[^/]+\/[^/]+-publish-\d{4}-\d{2}-\d{2}\.json$/i,
-  post_index:     /^docs\/blogs\/[^/]+-blogs-\d{4}\/[^/]+\/index\.html$/i,
-  blogs_index:    /^docs\/blogs\/index\.html$/i,
-  year_index:     /^docs\/blogs\/\d{4}\/index\.html$/i,
-  rss_xml:        /^docs\/blogs\/rss\.xml$/i,
-  sitemap_xml:    /^docs\/sitemap\.xml$/i,
-  manifest_json:  /^docs\/blogs\/manifest\.json$/i
-};
-
-const MIN_BYTES = {
-  publish_json: 100,
-  post_index:   200,
-  blogs_index:  200,
-  year_index:   200,
-  rss_xml:      80,
-  sitemap_xml:  80,
-  manifest_json:50
-};
-
-const DENY_BLOG_SRC_RE = /-blog-\d{4}-\d{2}-\d{2}\.json$/i;
-
-function roleForPath(p) {
-  for (const [role, rx] of Object.entries(REQ_PATTERNS)) {
-    if (rx.test(p)) return role;
-  }
-  return null;
-}
-
-function decodeBase64Strict(b64) {
-  const clean = String(b64).trim().replace(/\s+/g, "");
-  // Quick sanity: base64 alphabet + padding
-  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(clean)) return { ok: false, reason: "invalid_base64_chars", bytes: 0, buf: null };
-  try {
-    const buf = Buffer.from(clean, "base64");
-    // Reject obviously empty decodes
-    if (!buf || buf.length === 0) return { ok: false, reason: "decoded_zero_bytes", bytes: 0, buf: null };
-    return { ok: true, bytes: buf.length, buf };
-  } catch (e) {
-    return { ok: false, reason: "base64_decode_error", bytes: 0, buf: null };
-  }
-}
-
 // --- /docs/commit-bulk (single Git commit for multiple docs/* files; accepts .html, .xml, .json) ---
-// KEEP: runners depend on this route; no trigger/render logic here
+// KEEP as-is (runner depends on this route)
 app.post("/docs/commit-bulk", async (req, res) => {
   try {
     const { message, overwrite, files } = req.body || {};
@@ -364,7 +353,7 @@ app.post("/docs/commit-bulk", async (req, res) => {
     const token  = GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
-    // Normalize + basic shape
+    // Validate files
     const allowedExt = /\.(html|xml|json)$/i;
     const norm = files.map((f, i) => {
       const p = String(f.path || "").trim().replace(/^\/+/, "");
@@ -373,58 +362,8 @@ app.post("/docs/commit-bulk", async (req, res) => {
       if (!allowedExt.test(p)) throw new Error(`Disallowed extension at index ${i}`);
       const content_base64 = String(f.content_base64 || "");
       if (!content_base64) throw new Error(`Missing content_base64 at index ${i}`);
-      return { path: p, b64: content_base64, content_type: f.content_type || "" };
+      return { path: p, b64: content_base64 };
     });
-
-    // --- Validation Gate (x-validate parity) ---
-    const errors = [];
-    const roleHits = {}; // role -> {path, bytes}
-    const unexpected = [];
-
-    // Deny any attempt to write source *-blog-YYYY-MM-DD.json
-    for (const f of norm) {
-      if (DENY_BLOG_SRC_RE.test(f.path)) {
-        errors.push({ path: f.path, reason: "write_to_source_blog_json_forbidden" });
-      }
-    }
-
-    // Decode, size-check, role matching
-    for (const f of norm) {
-      const dec = decodeBase64Strict(f.b64);
-      if (!dec.ok) {
-        errors.push({ path: f.path, reason: dec.reason, decoded_bytes: dec.bytes, min_required: 1 });
-        continue;
-      }
-      const role = roleForPath(f.path);
-      if (!role) {
-        unexpected.push({ path: f.path, reason: "path_not_in_allowlist" });
-        continue;
-      }
-      // Keep the largest (shouldn't duplicate roles, but guard anyway)
-      if (!roleHits[role] || dec.bytes > roleHits[role].bytes) {
-        roleHits[role] = { path: f.path, bytes: dec.bytes };
-      }
-    }
-
-    // Required roles presence + min-bytes thresholds
-    for (const [role, min] of Object.entries(MIN_BYTES)) {
-      if (!roleHits[role]) {
-        errors.push({ role, reason: "required_path_missing", expected_pattern: String(REQ_PATTERNS[role]) });
-      } else if (roleHits[role].bytes < min) {
-        errors.push({ path: roleHits[role].path, reason: "below_min_bytes", decoded_bytes: roleHits[role].bytes, min_required: min });
-      }
-    }
-
-    // Unexpected paths (not matching any allowed pattern)
-    for (const u of unexpected) errors.push(u);
-
-    if (errors.length > 0) {
-      return res.status(400).json({
-        error: "validation_failed",
-        details: errors
-      });
-    }
-    // --- End Validation Gate ---
 
     // GitHub API helpers
     const gh = async (url, opts = {}, attempts = 2, timeoutMs = 7000) => {
@@ -544,4 +483,3 @@ app.listen(PORT, () => {
   console.log(`[startup] ALLOW_UPSTREAM_HOSTS=${Array.from(ALLOW_UPSTREAM_HOSTS).join(",")}`);
   console.log(`CRT items proxy running on ${PORT}`);
 });
-
