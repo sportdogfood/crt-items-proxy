@@ -427,6 +427,30 @@ app.post("/docs/commit-bulk", async (req, res) => {
     return res.status(500).json({ error: e.message || "bulk commit failed" });
   }
 });
+// --- /mirror/github (simple proxy to fetch GitHub raw content)
+app.get("/mirror/github", async (req, res) => {
+  try {
+    const target = req.query.url;
+    if (!target) {
+      return res.status(400).json({ error: "Missing ?url=" });
+    }
+
+    // Basic safety
+    if (!/^https:\/\/raw\.githubusercontent\.com\//i.test(target)) {
+      return res.status(400).json({ error: "Only raw.githubusercontent.com URLs allowed" });
+    }
+
+    const r = await fetch(target);
+    const text = await r.text();
+    const type = r.headers.get("content-type") || "text/plain";
+
+    res.set("Content-Type", type);
+    res.status(r.status).send(text);
+  } catch (err) {
+    console.error("mirror/github error", err);
+    res.status(500).json({ error: "mirror fetch failed", details: err.message });
+  }
+});
 
 // GET /docs/* -> proxy-read from upstream repo (raw)
 app.get("/docs/*", async (req, res) => {
