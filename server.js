@@ -427,6 +427,9 @@ app.post("/docs/commit-bulk", async (req, res) => {
     return res.status(500).json({ error: e.message || "bulk commit failed" });
   }
 });
+
+
+
 // --- /mirror/github (simple proxy to fetch GitHub raw content)
 app.get("/mirror/github", async (req, res) => {
   try {
@@ -452,6 +455,24 @@ app.get("/mirror/github", async (req, res) => {
   }
 });
 
+// --- /mirror/items (proxy for GitHub items directory)
+app.get("/mirror/items/*", async (req, res) => {
+  try {
+    const targetPath = req.params[0];
+    if (!targetPath) return res.status(400).json({ error: "Missing item path" });
+
+    const url = `https://raw.githubusercontent.com/sportdogfood/clear-round-datasets/main/items/${targetPath}`;
+    const r = await fetch(url);
+    if (!r.ok) return res.status(r.status).json({ error: `GitHub fetch failed (${r.status})` });
+
+    const text = await r.text();
+    const type = r.headers.get("content-type") || "application/json";
+    res.set("Content-Type", type).status(200).send(text);
+  } catch (err) {
+    console.error("mirror/items error", err);
+    res.status(500).json({ error: "mirror/items fetch failed", details: err.message });
+  }
+});
 // GET /docs/* -> proxy-read from upstream repo (raw)
 app.get("/docs/*", async (req, res) => {
   try {
