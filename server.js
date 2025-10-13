@@ -346,7 +346,7 @@ app.post("/docs/commit-bulk", async (req, res) => {
     const allowedExt = /\.(html|xml|json)$/i;
     const norm = files.map((f, i) => {
       const p = String(f.path || "").trim().replace(/^\/+/, "");
-      if (!p || !p.toLowerCase().startsWith("docs/")) throw new Error(`Bad path at index ${i}`);
+     if (!/^docs\//i.test(p)) throw new Error(`Bad path at index ${i} (${p})`);
       if (p.includes("..")) throw new Error(`Unsafe path at index ${i}`);
       if (!allowedExt.test(p)) throw new Error(`Disallowed extension at index ${i}`);
       const content_base64 = String(f.content_base64 || "");
