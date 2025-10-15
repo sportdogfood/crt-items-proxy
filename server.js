@@ -1,5 +1,5 @@
-// server.js — Clean CRT Items/Docs Proxy
-// Version 2025-10-13.clean-1a
+// server.js — Clean CRT Items/Docs Proxy (patched)
+// Version 2025-10-14.clean-1c
 
 import express from "express";
 import fetch from "node-fetch";
@@ -14,78 +14,150 @@ const app = express();
 const UPSTREAM_BASE = process.env.UPSTREAM_BASE; // e.g. https://raw.githubusercontent.com/sportdogfood/clear-round-datasets/main
 if (!UPSTREAM_BASE) throw new Error("Missing UPSTREAM_BASE");
 
-const GITHUB_REPO = process.env.GITHUB_REPO;
+const GITHUB_REPO   = process.env.GITHUB_REPO;
 const GITHUB_BRANCH = process.env.GITHUB_BRANCH || "main";
-const GITHUB_TOKEN = process.env.GITHUB_TOKEN || "";
+const GITHUB_TOKEN  = process.env.GITHUB_TOKEN || "";
 
 const CACHE_TTL = parseInt(process.env.CACHE_TTL || "300", 10);
-const memoryCache = new Map();
+
+// tiny in-memory cache
+const memoryCache = new Map(); // key -> { body, type, time }
 
 // --- Middleware ---
 app.use(morgan("tiny"));
 app.use(cors({ origin: "*" }));
 app.use(express.json({ limit: "2mb" }));
 
-// --- Helpers ---
-const allowedExt = /\.(json|txt|html|xml|csv)$/i;
-const safePath = rel => /^[a-z0-9][\w\-./]+$/i.test(rel) && !rel.includes("..") && allowedExt.test(rel);
-
-async function fetchWithRetry(url, { method = "GET", headers = {} } = {}, attempts = 2) {
-  let err;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      const r = await fetch(url, { method, headers });
-      if (r.status >= 500 && i + 1 < attempts) continue;
-      return r;
-    } catch (e) { err = e; }
+// PATCH: tolerate double-encoded JSON bodies and stringified "json" field
+app.use((req, _res, next) => {
+  if (req.is("application/json") && typeof req.body === "string") {
+    try { req.body = JSON.parse(req.body); } catch { /* ignore */ }
   }
-  throw err;
+  // If body exists and has a stringified `json` field, normalize it
+  if (req.body && typeof req.body.json === "string") {
+    try { req.body.json = JSON.parse(req.body.json); } catch { /* leave as-is */ }
+  }
+  next();
+});
+
+// --- Helpers ---
+const allowedExt = /\.(json|txt|html|xml|csv|ndjson|md)$/i;
+const safePath = (rel) =>
+  typeof rel === "string" &&
+  rel.length > 0 &&
+  /^[a-z0-9][\w\-./]+$/i.test(rel) &&
+  !rel.includes("..") &&
+  allowedExt.test(rel);
+
+// PATCH: robust fetch with retry + timeout + body passthrough
+async function fetchWithRetry(
+  url,
+  options = {},
+  retry = { attempts: 2, timeoutMs: 10000 }
+) {
+  let lastErr;
+  for (let i = 0; i < (retry.attempts ?? 2); i++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), retry.timeoutMs ?? 10000);
+    try {
+      const r = await fetch(url, { ...options, signal: controller.signal });
+      clearTimeout(timer);
+      // retry only on 5xx
+      if (r.status >= 500 && r.status < 600 && i + 1 < (retry.attempts ?? 2)) {
+        await new Promise((res) => setTimeout(res, 250 * (i + 1)));
+        continue;
+      }
+      return r;
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      if (i + 1 < (retry.attempts ?? 2)) {
+        await new Promise((res) => setTimeout(res, 250 * (i + 1)));
+        continue;
+      }
+      throw lastErr;
+    }
+  }
+  throw lastErr;
+}
+
+function cacheGet(key) {
+  const c = memoryCache.get(key);
+  if (!c) return null;
+  if (Date.now() - c.time > CACHE_TTL * 1000) {
+    memoryCache.delete(key);
+    return null;
+  }
+  return c;
+}
+
+function cacheSet(key, body, type) {
+  memoryCache.set(key, { body, type, time: Date.now() });
 }
 
 // --- /health ---
-app.get("/health", (req, res) => res.status(200).send("OK"));
+app.get("/health", (_req, res) => res.status(200).send("OK"));
 
 // --- /items/* — Proxy GET from GitHub main/items ---
 app.get("/items/*", async (req, res) => {
-  const rel = req.params[0];
+  const rel = String(req.params[0] || "");
   if (!safePath(rel)) return res.status(400).json({ error: "Invalid path" });
+
   const key = `items/${rel}`;
-  if (memoryCache.has(key)) {
-    const c = memoryCache.get(key);
-    if (Date.now() - c.time < CACHE_TTL * 1000) {
-      res.type(c.type).send(c.body);
-      return;
-    }
+  const cached = cacheGet(key);
+  if (cached) {
+    res.type(cached.type || "application/json").send(cached.body);
+    return;
   }
 
   const url = `${UPSTREAM_BASE}/items/${rel}`;
-  const r = await fetchWithRetry(url);
+  const r = await fetchWithRetry(url, { method: "GET" });
   if (!r.ok) return res.status(r.status).json({ error: `Upstream ${r.status}` });
+
   const text = await r.text();
-  const type = r.headers.get("content-type") || "application/json";
-  memoryCache.set(key, { body: text, type, time: Date.now() });
+  const type = r.headers.get("content-type") || "application/json; charset=utf-8";
+  cacheSet(key, text, type);
   res.type(type).send(text);
 });
 
-// --- GitHub commit endpoint (fixed charset + validation) ---
+// --- /docs/* — read-only proxy for published outputs ---
+app.get("/docs/*", async (req, res) => {
+  const rel = String(req.params[0] || "");
+  if (!safePath(rel)) return res.status(400).json({ error: "Invalid path" });
+
+  const key = `docs/${rel}`;
+  const cached = cacheGet(key);
+  if (cached) {
+    res.type(cached.type || "application/json").send(cached.body);
+    return;
+  }
+
+  const url = `${UPSTREAM_BASE}/docs/${rel}`;
+  const r = await fetchWithRetry(url, { method: "GET" });
+  if (!r.ok) return res.status(r.status).json({ error: `Upstream ${r.status}` });
+
+  const text = await r.text();
+  const type = r.headers.get("content-type") || "application/json; charset=utf-8";
+  cacheSet(key, text, type);
+  res.type(type).send(text);
+});
+
+// --- /items/commit — GitHub commit endpoint (single file) ---
 app.post("/items/commit", async (req, res) => {
   try {
-    let { path, json, message } = req.body;
+    let { path, json, message } = req.body || {};
     if (!path || json === undefined || json === null) {
       return res.status(400).json({ error: "path and json required" });
     }
 
-    let rel = String(path).replace(/^\/+/, "").replace(/^items\//, "");
-    if (!isAllowedPath(rel)) return res.status(400).json({ error: "Path not allowed" });
+    let rel = String(path).replace(/^\/+/, "").replace(/^items\//i, "");
+    if (!safePath(rel)) return res.status(400).json({ error: "Path not allowed" });
 
     const isJson = /\.json$/i.test(rel);
-    if (!isJson && typeof json !== "string") {
-      return res.status(400).json({ error: "For text files, json must be a string body" });
-    }
 
-    const repo   = GITHUB_REPO;
+    const repo  = GITHUB_REPO;
+    const token = GITHUB_TOKEN;
     const branch = GITHUB_BRANCH;
-    const token  = GITHUB_TOKEN;
     if (!repo || !token) {
       return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
     }
@@ -93,15 +165,13 @@ app.post("/items/commit", async (req, res) => {
     let contentStr;
     if (isJson) {
       try {
-        contentStr = JSON.stringify(
-          typeof json === "string" ? JSON.parse(json) : json,
-          null,
-          2
-        ) + "\n";
+        const obj = (typeof json === "string") ? JSON.parse(json) : json;
+        contentStr = JSON.stringify(obj, null, 2) + "\n";
       } catch (e) {
         return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` });
       }
     } else {
+      // non-JSON text file
       contentStr = String(json).replace(/\r\n?/g, "\n");
       if (!contentStr.endsWith("\n")) contentStr += "\n";
     }
@@ -115,11 +185,14 @@ app.post("/items/commit", async (req, res) => {
       "User-Agent": "crt-items-proxy"
     };
 
+    // HEAD meta (get current sha if exists)
     let sha;
-    const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
-    if (head.ok) {
-      const meta = await head.json();
-      sha = meta.sha;
+    {
+      const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
+      if (head.ok) {
+        const meta = await head.json();
+        sha = meta?.sha;
+      }
     }
 
     const body = {
@@ -129,11 +202,18 @@ app.post("/items/commit", async (req, res) => {
     };
     if (sha) body.sha = sha;
 
-    const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
+    const put = await fetchWithRetry(
+      api,
+      { method: "PUT", headers, body: JSON.stringify(body) },
+      { attempts: 2, timeoutMs: 10000 }
+    );
     const result = await put.json();
     if (!put.ok) return res.status(put.status).json(result);
 
-    memoryCache.delete(rel);
+    // PATCH: invalidate the correct cache key
+    memoryCache.delete(repoPath); // exact
+    memoryCache.delete(rel);      // legacy
+    memoryCache.delete(`items/${rel}`);
 
     res.json({
       ok: true,
@@ -141,14 +221,12 @@ app.post("/items/commit", async (req, res) => {
       commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url }
     });
   } catch (e) {
-    console.error(e);
+    console.error("items/commit error:", e);
     res.status(500).json({ error: "Commit failed", details: e.message });
   }
 });
 
-
 // --- /docs/commit — single JSON doc commit ---
-// --- /docs/commit (fixed charset + validation) ---
 app.post("/docs/commit", async (req, res) => {
   try {
     let { path: p, json, message } = req.body || {};
@@ -156,17 +234,24 @@ app.post("/docs/commit", async (req, res) => {
       return res.status(400).json({ error: "path and json required" });
     }
 
-    let rel = String(p).trim().replace(/^\/+/, "").replace(/^docs\//, "");
-    if (!/\.json$/i.test(rel)) return res.status(400).json({ error: "Docs commits require a .json file path" });
+    let rel = String(p).trim().replace(/^\/+/, "").replace(/^docs\//i, "");
+    // must be .json and must be safe
+    if (!/\.json$/i.test(rel) || !safePath(rel)) {
+      return res.status(400).json({ error: "Docs commits require a safe .json file path" });
+    }
 
-    const repo   = GITHUB_REPO;
+    const repo  = GITHUB_REPO;
+    const token = GITHUB_TOKEN;
     const branch = GITHUB_BRANCH;
-    const token  = GITHUB_TOKEN;
     if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
 
     let contentStr;
-    try { contentStr = JSON.stringify(typeof json === "string" ? JSON.parse(json) : json, null, 2) + "\n"; }
-    catch (e) { return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` }); }
+    try {
+      const obj = (typeof json === "string") ? JSON.parse(json) : json;
+      contentStr = JSON.stringify(obj, null, 2) + "\n";
+    } catch (e) {
+      return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` });
+    }
 
     const repoPath = `docs/${rel}`;
     const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
@@ -177,9 +262,15 @@ app.post("/docs/commit", async (req, res) => {
       "User-Agent": "crt-docs-proxy"
     };
 
+    // HEAD meta (get current sha if exists)
     let sha;
-    const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
-    if (head.ok) { const meta = await head.json(); sha = meta.sha; }
+    {
+      const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
+      if (head.ok) {
+        const meta = await head.json();
+        sha = meta?.sha;
+      }
+    }
 
     const body = {
       message: message || `chore: commit ${repoPath}`,
@@ -188,22 +279,28 @@ app.post("/docs/commit", async (req, res) => {
     };
     if (sha) body.sha = sha;
 
-    const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
+    const put = await fetchWithRetry(
+      api,
+      { method: "PUT", headers, body: JSON.stringify(body) },
+      { attempts: 2, timeoutMs: 10000 }
+    );
     const result = await put.json();
     if (!put.ok) return res.status(put.status).json(result);
 
+    memoryCache.delete(repoPath);
+    memoryCache.delete(rel);
     memoryCache.delete(`docs/${rel}`);
+
     return res.status(200).json({
       ok: true,
       path: repoPath,
       commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url }
     });
   } catch (e) {
-    console.error(e);
+    console.error("docs/commit error:", e);
     return res.status(500).json({ error: "Docs commit failed", details: e.message });
   }
 });
-
 
 // --- /docs/commit-bulk — Structure Runner (7-file blog publish) ---
 app.post("/docs/commit-bulk", async (req, res) => {
@@ -212,73 +309,126 @@ app.post("/docs/commit-bulk", async (req, res) => {
     if (!Array.isArray(files) || files.length === 0)
       return res.status(400).json({ error: "files[] required" });
 
+    const repo  = GITHUB_REPO;
+    const token = GITHUB_TOKEN;
+    const branch = GITHUB_BRANCH;
+    if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
+
     const headers = {
-      Authorization: `Bearer ${GITHUB_TOKEN}`,
+      Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
       "User-Agent": "crt-docs-proxy"
     };
 
-    const refUrl = `https://api.github.com/repos/${GITHUB_REPO}/git/refs/heads/${GITHUB_BRANCH}`;
-    const ref = await fetchWithRetry(refUrl, { headers });
+    // PATCH: validate each file path and extension and ensure docs/ prefix
+    const allowedBulkExt = /\.(html|xml|json)$/i;
+    for (const [i, f] of files.entries()) {
+      if (!f || !f.path || !f.content_base64) {
+        return res.status(400).json({ error: `files[${i}] requires path and content_base64` });
+      }
+      const p = String(f.path);
+      if (!/^docs\//i.test(p)) {
+        return res.status(400).json({ error: `files[${i}].path must start with 'docs/'` });
+      }
+      const clean = p.replace(/^docs\//i, "");
+      if (!safePath(clean) || !allowedBulkExt.test(p)) {
+        return res.status(400).json({ error: `files[${i}].path is not safe or has disallowed extension` });
+      }
+    }
+
+    // get current branch ref
+    const refUrl = `https://api.github.com/repos/${repo}/git/refs/heads/${encodeURIComponent(branch)}`;
+    const ref = await fetchWithRetry(refUrl, { headers }, { attempts: 2, timeoutMs: 7000 });
+    if (!ref.ok) return res.status(ref.status).json({ error: `ref ${ref.status}` });
     const refJson = await ref.json();
     const baseCommit = refJson.object?.sha;
+    if (!baseCommit) return res.status(500).json({ error: "Missing base commit sha" });
 
+    // find base tree
     const commitResp = await fetchWithRetry(
-      `https://api.github.com/repos/${GITHUB_REPO}/git/commits/${baseCommit}`, { headers });
-    const baseTree = (await commitResp.json()).tree?.sha;
+      `https://api.github.com/repos/${repo}/git/commits/${baseCommit}`, { headers }, { attempts: 2, timeoutMs: 7000 }
+    );
+    if (!commitResp.ok) return res.status(commitResp.status).json({ error: `commit ${commitResp.status}` });
+    const commitJson = await commitResp.json();
+    const baseTree = commitJson.tree?.sha;
+    if (!baseTree) return res.status(500).json({ error: "Missing base tree sha" });
 
+    // create blobs
     const blobShas = [];
     for (const f of files) {
-      const b = await fetchWithRetry(`https://api.github.com/repos/${GITHUB_REPO}/git/blobs`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ content: f.content_base64, encoding: "base64" })
-      });
-      const j = await b.json();
+      const blob = await fetchWithRetry(
+        `https://api.github.com/repos/${repo}/git/blobs`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ content: f.content_base64, encoding: "base64" })
+        },
+        { attempts: 2, timeoutMs: 7000 }
+      );
+      const j = await blob.json();
+      if (!blob.ok) return res.status(blob.status).json({ error: `blob ${blob.status}`, details: j });
       blobShas.push({ path: f.path, sha: j.sha });
     }
 
-    const treeResp = await fetchWithRetry(`https://api.github.com/repos/${GITHUB_REPO}/git/trees`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ base_tree: baseTree, tree: blobShas.map(x => ({ path: x.path, mode: "100644", type: "blob", sha: x.sha })) })
-    });
-    const newTree = (await treeResp.json()).sha;
+    // create tree
+    const treeResp = await fetchWithRetry(
+      `https://api.github.com/repos/${repo}/git/trees`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          base_tree: baseTree,
+          tree: blobShas.map(x => ({ path: x.path, mode: "100644", type: "blob", sha: x.sha }))
+        })
+      },
+      { attempts: 2, timeoutMs: 7000 }
+    );
+    const treeJson = await treeResp.json();
+    if (!treeResp.ok) return res.status(treeResp.status).json({ error: `tree ${treeResp.status}`, details: treeJson });
+    const newTree = treeJson.sha;
 
-    const commitPost = await fetchWithRetry(`https://api.github.com/repos/${GITHUB_REPO}/git/commits`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ message: message || "bulk publish", tree: newTree, parents: [baseCommit] })
-    });
+    // create commit
+    const commitPost = await fetchWithRetry(
+      `https://api.github.com/repos/${repo}/git/commits`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ message: message || "bulk publish", tree: newTree, parents: [baseCommit] })
+      },
+      { attempts: 2, timeoutMs: 7000 }
+    );
     const newCommit = await commitPost.json();
+    if (!commitPost.ok) return res.status(commitPost.status).json({ error: `commit-post ${commitPost.status}`, details: newCommit });
 
-    await fetchWithRetry(refUrl, {
-      method: "PATCH",
-      headers,
-      body: JSON.stringify({ sha: newCommit.sha, force: !!overwrite })
-    });
+    // move ref
+    const refPatch = await fetchWithRetry(
+      refUrl,
+      { method: "PATCH", headers, body: JSON.stringify({ sha: newCommit.sha, force: !!overwrite }) },
+      { attempts: 2, timeoutMs: 7000 }
+    );
+    if (!refPatch.ok) {
+      const j = await refPatch.json().catch(() => ({}));
+      return res.status(refPatch.status).json({ error: `ref-patch ${refPatch.status}`, details: j });
+    }
+
+    // invalidate simple caches
+    for (const f of files) {
+      memoryCache.delete(f.path);
+      if (f.path.startsWith("docs/")) {
+        memoryCache.delete(f.path.slice(5));
+        memoryCache.delete(`docs/${f.path.slice(5)}`);
+      }
+    }
 
     res.json({
       ok: true,
-      commit: { sha: newCommit.sha, url: newCommit.html_url },
+      commit: { sha: newCommit.sha, url: newCommit.html_url || `https://github.com/${repo}/commit/${newCommit.sha}` },
       committed_paths: files.map(f => f.path)
     });
   } catch (e) {
-    console.error(e);
+    console.error("docs/commit-bulk error:", e);
     res.status(500).json({ error: e.message });
   }
-});
-
-// --- /docs/* — read-only proxy for published outputs ---
-app.get("/docs/*", async (req, res) => {
-  const rel = req.params[0];
-  if (!safePath(rel)) return res.status(400).json({ error: "Invalid path" });
-  const url = `${UPSTREAM_BASE}/docs/${rel}`;
-  const r = await fetchWithRetry(url);
-  if (!r.ok) return res.status(r.status).json({ error: `Upstream ${r.status}` });
-  const text = await r.text();
-  const type = r.headers.get("content-type") || "application/json";
-  res.type(type).send(text);
 });
 
 // --- Startup ---
@@ -286,4 +436,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`[startup] CRT proxy running on ${PORT}`);
   console.log(`[startup] Upstream: ${UPSTREAM_BASE}`);
+  console.log(`[startup] Branch:  ${GITHUB_BRANCH}`);
+  console.log(`[startup] Repo:    ${GITHUB_REPO}`);
 });
