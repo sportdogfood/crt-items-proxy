@@ -67,87 +67,143 @@ app.get("/items/*", async (req, res) => {
   res.type(type).send(text);
 });
 
-// --- /items/commit — Airtable or item-level commits ---
+// --- GitHub commit endpoint (fixed charset + validation) ---
 app.post("/items/commit", async (req, res) => {
   try {
-    const { path, json, message } = req.body || {};
-    if (!path || json === undefined) return res.status(400).json({ error: "path and json required" });
-    const rel = path.replace(/^\/+/, "").replace(/^items\//, "");
-    if (!safePath(rel)) return res.status(400).json({ error: "Unsafe path" });
+    let { path, json, message } = req.body;
+    if (!path || json === undefined || json === null) {
+      return res.status(400).json({ error: "path and json required" });
+    }
 
-    if (!GITHUB_REPO || !GITHUB_TOKEN) return res.status(500).json({ error: "Missing GitHub credentials" });
+    let rel = String(path).replace(/^\/+/, "").replace(/^items\//, "");
+    if (!isAllowedPath(rel)) return res.status(400).json({ error: "Path not allowed" });
+
+    const isJson = /\.json$/i.test(rel);
+    if (!isJson && typeof json !== "string") {
+      return res.status(400).json({ error: "For text files, json must be a string body" });
+    }
+
+    const repo   = GITHUB_REPO;
+    const branch = GITHUB_BRANCH;
+    const token  = GITHUB_TOKEN;
+    if (!repo || !token) {
+      return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
+    }
+
+    let contentStr;
+    if (isJson) {
+      try {
+        contentStr = JSON.stringify(
+          typeof json === "string" ? JSON.parse(json) : json,
+          null,
+          2
+        ) + "\n";
+      } catch (e) {
+        return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` });
+      }
+    } else {
+      contentStr = String(json).replace(/\r\n?/g, "\n");
+      if (!contentStr.endsWith("\n")) contentStr += "\n";
+    }
+
     const repoPath = `items/${rel}`;
-    const api = `https://api.github.com/repos/${GITHUB_REPO}/contents/${repoPath}`;
+    const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
     const headers = {
-      Authorization: `Bearer ${GITHUB_TOKEN}`,
+      Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
+      "Content-Type": "application/json; charset=utf-8",
       "User-Agent": "crt-items-proxy"
     };
 
-    let contentStr;
-    if (typeof json === "string") contentStr = json;
-    else contentStr = JSON.stringify(json, null, 2) + "\n";
-
-    const head = await fetchWithRetry(`${api}?ref=${GITHUB_BRANCH}`, { headers });
     let sha;
-    if (head.ok) sha = (await head.json()).sha;
+    const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
+    if (head.ok) {
+      const meta = await head.json();
+      sha = meta.sha;
+    }
 
     const body = {
-      message: message || `update ${repoPath}`,
-      content: Buffer.from(contentStr).toString("base64"),
-      branch: GITHUB_BRANCH,
-      ...(sha && { sha })
+      message: message || `chore: update ${repoPath}`,
+      content: Buffer.from(contentStr, "utf8").toString("base64"),
+      branch
     };
-    const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) });
+    if (sha) body.sha = sha;
+
+    const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
     const result = await put.json();
     if (!put.ok) return res.status(put.status).json(result);
 
-    memoryCache.delete(repoPath);
-    res.json({ ok: true, commit: { sha: result.commit.sha, url: result.commit.html_url } });
+    memoryCache.delete(rel);
+
+    res.json({
+      ok: true,
+      path: repoPath,
+      commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url }
+    });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    res.status(500).json({ error: "Commit failed", details: e.message });
   }
 });
 
+
 // --- /docs/commit — single JSON doc commit ---
+// --- /docs/commit (fixed charset + validation) ---
 app.post("/docs/commit", async (req, res) => {
   try {
-    const { path, json, message } = req.body || {};
-    if (!path || json === undefined) return res.status(400).json({ error: "path and json required" });
-    const rel = path.replace(/^\/+/, "").replace(/^docs\//, "");
-    if (!safePath(rel)) return res.status(400).json({ error: "Unsafe path" });
+    let { path: p, json, message } = req.body || {};
+    if (!p || json === undefined || json === null) {
+      return res.status(400).json({ error: "path and json required" });
+    }
+
+    let rel = String(p).trim().replace(/^\/+/, "").replace(/^docs\//, "");
+    if (!/\.json$/i.test(rel)) return res.status(400).json({ error: "Docs commits require a .json file path" });
+
+    const repo   = GITHUB_REPO;
+    const branch = GITHUB_BRANCH;
+    const token  = GITHUB_TOKEN;
+    if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
+
+    let contentStr;
+    try { contentStr = JSON.stringify(typeof json === "string" ? JSON.parse(json) : json, null, 2) + "\n"; }
+    catch (e) { return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` }); }
 
     const repoPath = `docs/${rel}`;
-    const api = `https://api.github.com/repos/${GITHUB_REPO}/contents/${repoPath}`;
+    const api = `https://api.github.com/repos/${repo}/contents/${repoPath}`;
     const headers = {
-      Authorization: `Bearer ${GITHUB_TOKEN}`,
+      Authorization: `Bearer ${token}`,
       Accept: "application/vnd.github+json",
+      "Content-Type": "application/json; charset=utf-8",
       "User-Agent": "crt-docs-proxy"
     };
 
-    const head = await fetchWithRetry(`${api}?ref=${GITHUB_BRANCH}`, { headers });
     let sha;
-    if (head.ok) sha = (await head.json()).sha;
+    const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
+    if (head.ok) { const meta = await head.json(); sha = meta.sha; }
 
-    const contentStr = JSON.stringify(typeof json === "string" ? JSON.parse(json) : json, null, 2) + "\n";
     const body = {
-      message: message || `update ${repoPath}`,
-      content: Buffer.from(contentStr).toString("base64"),
-      branch: GITHUB_BRANCH,
-      ...(sha && { sha })
+      message: message || `chore: commit ${repoPath}`,
+      content: Buffer.from(contentStr, "utf8").toString("base64"),
+      branch
     };
-    const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) });
+    if (sha) body.sha = sha;
+
+    const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(body) }, { attempts: 2, timeoutMs: 7000 });
     const result = await put.json();
     if (!put.ok) return res.status(put.status).json(result);
 
-    memoryCache.delete(repoPath);
-    res.json({ ok: true, commit: { sha: result.commit.sha, url: result.commit.html_url } });
+    memoryCache.delete(`docs/${rel}`);
+    return res.status(200).json({
+      ok: true,
+      path: repoPath,
+      commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url }
+    });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message });
+    return res.status(500).json({ error: "Docs commit failed", details: e.message });
   }
 });
+
 
 // --- /docs/commit-bulk — Structure Runner (7-file blog publish) ---
 app.post("/docs/commit-bulk", async (req, res) => {
