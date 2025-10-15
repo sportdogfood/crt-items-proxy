@@ -143,21 +143,31 @@ app.get("/docs/*", async (req, res) => {
 });
 
 // --- /items/commit — GitHub commit endpoint (single file) ---
+
+// --- GitHub commit endpoint (fixed charset + validation + cache bust + defensive parse) ---
 app.post("/items/commit", async (req, res) => {
   try {
-    let { path, json, message } = req.body || {};
+    // defensively handle double-stringified bodies from Airtable
+    let body = req.body;
+    if (typeof body === "string") {
+      try { body = JSON.parse(body); } catch { /* leave as-is */ }
+    }
+    let { path, json, message } = body || {};
     if (!path || json === undefined || json === null) {
       return res.status(400).json({ error: "path and json required" });
     }
 
-    let rel = String(path).replace(/^\/+/, "").replace(/^items\//i, "");
+    let rel = String(path).replace(/^\/+/, "").replace(/^items\//, "");
     if (!safePath(rel)) return res.status(400).json({ error: "Path not allowed" });
 
     const isJson = /\.json$/i.test(rel);
+    if (!isJson && typeof json !== "string") {
+      return res.status(400).json({ error: "For text files, json must be a string body" });
+    }
 
-    const repo  = GITHUB_REPO;
-    const token = GITHUB_TOKEN;
+    const repo   = GITHUB_REPO;
     const branch = GITHUB_BRANCH;
+    const token  = GITHUB_TOKEN;
     if (!repo || !token) {
       return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
     }
@@ -165,13 +175,15 @@ app.post("/items/commit", async (req, res) => {
     let contentStr;
     if (isJson) {
       try {
-        const obj = (typeof json === "string") ? JSON.parse(json) : json;
-        contentStr = JSON.stringify(obj, null, 2) + "\n";
+        contentStr = JSON.stringify(
+          typeof json === "string" ? JSON.parse(json) : json,
+          null,
+          2
+        ) + "\n";
       } catch (e) {
         return res.status(400).json({ error: `Invalid JSON payload: ${e.message}` });
       }
     } else {
-      // non-JSON text file
       contentStr = String(json).replace(/\r\n?/g, "\n");
       if (!contentStr.endsWith("\n")) contentStr += "\n";
     }
@@ -185,44 +197,33 @@ app.post("/items/commit", async (req, res) => {
       "User-Agent": "crt-items-proxy"
     };
 
-    // HEAD meta (get current sha if exists)
+    // HEAD to see if file exists (to include sha)
     let sha;
-    {
-      const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
-      if (head.ok) {
-        const meta = await head.json();
-        sha = meta?.sha;
-      }
-    }
+    const head = await fetchWithRetry(`${api}?ref=${encodeURIComponent(branch)}`, { headers }, { attempts: 2, timeoutMs: 5000 });
+    if (head.ok) { const meta = await head.json(); sha = meta.sha; }
 
-    const body = {
+    const bodyOut = {
       message: message || `chore: update ${repoPath}`,
       content: Buffer.from(contentStr, "utf8").toString("base64"),
       branch
     };
-    if (sha) body.sha = sha;
+    if (sha) bodyOut.sha = sha;
 
-    const put = await fetchWithRetry(
-      api,
-      { method: "PUT", headers, body: JSON.stringify(body) },
-      { attempts: 2, timeoutMs: 10000 }
-    );
+    const put = await fetchWithRetry(api, { method: "PUT", headers, body: JSON.stringify(bodyOut) }, { attempts: 2, timeoutMs: 7000 });
     const result = await put.json();
     if (!put.ok) return res.status(put.status).json(result);
 
-    // PATCH: invalidate the correct cache key
-    memoryCache.delete(repoPath); // exact
-    memoryCache.delete(rel);      // legacy
+    // ✅ Correct cache bust: clear the key used by GET /items/*
     memoryCache.delete(`items/${rel}`);
 
-    res.json({
+    return res.json({
       ok: true,
       path: repoPath,
       commit: result.commit && { sha: result.commit.sha, url: result.commit.html_url }
     });
   } catch (e) {
-    console.error("items/commit error:", e);
-    res.status(500).json({ error: "Commit failed", details: e.message });
+    console.error(e);
+    return res.status(500).json({ error: "Commit failed", details: e.message });
   }
 });
 
