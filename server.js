@@ -41,7 +41,8 @@ app.use((req, _res, next) => {
 });
 
 // --- Helpers ---
-const allowedExt = /\.(json|txt|html|xml|csv|ndjson|md)$/i;
+const allowedExt = /\.(json|txt|html|xml|csv|ndjson|md|tmpl|css)$/i;
+
 const safePath = (rel) =>
   typeof rel === "string" &&
   rel.length > 0 &&
