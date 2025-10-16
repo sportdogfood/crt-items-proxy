@@ -432,6 +432,130 @@ app.post("/docs/commit-bulk", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+// --- /items/commit-bulk — Bulk commit to items/* (runner writes data assets) ---
+app.post("/items/commit-bulk", async (req, res) => {
+  try {
+    const { message, overwrite, files } = req.body || {};
+    if (!Array.isArray(files) || files.length === 0)
+      return res.status(400).json({ error: "files[] required" });
+
+    const repo  = GITHUB_REPO;
+    const token = GITHUB_TOKEN;
+    const branch = GITHUB_BRANCH;
+    if (!repo || !token) return res.status(500).json({ error: "Missing GITHUB_REPO or GITHUB_TOKEN" });
+
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      Accept: "application/vnd.github+json",
+      "User-Agent": "crt-items-proxy"
+    };
+
+    // Validate: enforce items/ prefix and restrict to data-friendly extensions
+    const allowedBulkExt = /\.(json|txt|csv|ndjson|md|tmpl)$/i;
+    for (const [i, f] of files.entries()) {
+      if (!f || !f.path || !f.content_base64) {
+        return res.status(400).json({ error: `files[${i}] requires path and content_base64` });
+      }
+      const p = String(f.path);
+      if (!/^items\//i.test(p)) {
+        return res.status(400).json({ error: `files[${i}].path must start with 'items/'` });
+      }
+      const clean = p.replace(/^items\//i, "");
+      if (!safePath(clean) || !allowedBulkExt.test(p)) {
+        return res.status(400).json({ error: `files[${i}].path is not safe or has disallowed extension` });
+      }
+    }
+
+    // Get current branch ref
+    const refUrl = `https://api.github.com/repos/${repo}/git/refs/heads/${encodeURIComponent(branch)}`;
+    const ref = await fetchWithRetry(refUrl, { headers }, { attempts: 2, timeoutMs: 7000 });
+    if (!ref.ok) return res.status(ref.status).json({ error: `ref ${ref.status}` });
+    const refJson = await ref.json();
+    const baseCommit = refJson.object?.sha;
+    if (!baseCommit) return res.status(500).json({ error: "Missing base commit sha" });
+
+    // Base tree
+    const commitResp = await fetchWithRetry(
+      `https://api.github.com/repos/${repo}/git/commits/${baseCommit}`, { headers }, { attempts: 2, timeoutMs: 7000 }
+    );
+    if (!commitResp.ok) return res.status(commitResp.status).json({ error: `commit ${commitResp.status}` });
+    const commitJson = await commitResp.json();
+    const baseTree = commitJson.tree?.sha;
+    if (!baseTree) return res.status(500).json({ error: "Missing base tree sha" });
+
+    // Create blobs
+    const blobShas = [];
+    for (const f of files) {
+      const blob = await fetchWithRetry(
+        `https://api.github.com/repos/${repo}/git/blobs`,
+        { method: "POST", headers, body: JSON.stringify({ content: f.content_base64, encoding: "base64" }) },
+        { attempts: 2, timeoutMs: 7000 }
+      );
+      const j = await blob.json();
+      if (!blob.ok) return res.status(blob.status).json({ error: `blob ${blob.status}`, details: j });
+      blobShas.push({ path: f.path, sha: j.sha });
+    }
+
+    // Create tree
+    const treeResp = await fetchWithRetry(
+      `https://api.github.com/repos/${repo}/git/trees`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          base_tree: baseTree,
+          tree: blobShas.map(x => ({ path: x.path, mode: "100644", type: "blob", sha: x.sha }))
+        })
+      },
+      { attempts: 2, timeoutMs: 7000 }
+    );
+    const treeJson = await treeResp.json();
+    if (!treeResp.ok) return res.status(treeResp.status).json({ error: `tree ${treeResp.status}`, details: treeJson });
+    const newTree = treeJson.sha;
+
+    // Create commit
+    const commitPost = await fetchWithRetry(
+      `https://api.github.com/repos/${repo}/git/commits`,
+      {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ message: message || "items bulk commit", tree: newTree, parents: [baseCommit] })
+      },
+      { attempts: 2, timeoutMs: 7000 }
+    );
+    const newCommit = await commitPost.json();
+    if (!commitPost.ok) return res.status(commitPost.status).json({ error: `commit-post ${commitPost.status}`, details: newCommit });
+
+    // Move ref
+    const refPatch = await fetchWithRetry(
+      refUrl,
+      { method: "PATCH", headers, body: JSON.stringify({ sha: newCommit.sha, force: !!overwrite }) },
+      { attempts: 2, timeoutMs: 7000 }
+    );
+    if (!refPatch.ok) {
+      const j = await refPatch.json().catch(() => ({}));
+      return res.status(refPatch.status).json({ error: `ref-patch ${refPatch.status}`, details: j });
+    }
+
+    // Invalidate caches for affected items/*
+    for (const f of files) {
+      memoryCache.delete(f.path); // exact key
+      if (f.path.startsWith("items/")) {
+        const rel = f.path.slice(6);
+        memoryCache.delete(`items/${rel}`); // GET /items/* cache key
+      }
+    }
+
+    res.json({
+      ok: true,
+      commit: { sha: newCommit.sha, url: newCommit.html_url || `https://github.com/${repo}/commit/${newCommit.sha}` },
+      committed_paths: files.map(f => f.path)
+    });
+  } catch (e) {
+    console.error("items/commit-bulk error:", e);
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // --- Startup ---
 const PORT = process.env.PORT || 3000;
