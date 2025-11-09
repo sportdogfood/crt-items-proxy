@@ -556,6 +556,48 @@ app.post("/items/commit-bulk", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+// --- /items/commit-simple — lightweight trigger for mobile or voice ---
+app.all("/items/commit-simple", async (req, res) => {
+  try {
+    const { path, message = "simple update" } =
+      req.method === "GET" ? req.query : req.body;
+    if (!path) return res.status(400).json({ ok: false, error: "missing path" });
+
+    // reuse local proxy instead of direct GitHub write
+    const getUrl = `${req.protocol}://${req.get("host")}/items/${path.replace(/^items\//, "")}`;
+    const current = await fetchWithRetry(getUrl, { method: "GET" });
+    if (!current.ok)
+      return res.status(current.status).json({ ok: false, error: `file fetch ${current.status}` });
+    const text = await current.text();
+
+    // wrap for /items/commit-bulk
+    const commitBody = {
+      message,
+      overwrite: true,
+      files: [
+        {
+          path: path.startsWith("items/") ? path : `items/${path}`,
+          content_base64: Buffer.from(text).toString("base64"),
+          content_type: "application/json"
+        }
+      ]
+    };
+
+    const commit = await fetchWithRetry(
+      `${req.protocol}://${req.get("host")}/items/commit-bulk`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(commitBody)
+      }
+    );
+
+    const result = await commit.json();
+    res.status(commit.status).json(result);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 // --- Startup ---
 const PORT = process.env.PORT || 3000;
