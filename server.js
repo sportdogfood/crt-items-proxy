@@ -6,6 +6,7 @@ import fetch from "node-fetch";
 import cors from "cors";
 import morgan from "morgan";
 import dotenv from "dotenv";
+import { execFile } from "child_process";
 dotenv.config();
 
 const app = express();
@@ -1242,6 +1243,621 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
           }
         : undefined
     };
+
+    return res.json(resp);
+  } catch (e) {
+    console.error("list-runner/command error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+// --- /items/agents/list-runner/command --- primary List-Runner write surface ---
+app.post("/items/agents/list-runner/command", async (req, res) => {
+  try {
+    const { device_id, command, now, debug } = req.body || {};
+    if (!device_id || !command) {
+      return res.status(400).json({ ok: false, error: "device_id and command required" });
+    }
+
+    const ts = typeof now === "string" ? now : new Date().toISOString();
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const ROOT = "agents/list-runner";
+
+    // ---------- helpers ----------
+    async function readJson(rel, fallback) {
+      const url = `${baseUrl}/items/${rel}`;
+      const r = await fetchWithRetry(url, { method: "GET" });
+      if (r.status === 404) return fallback;
+      if (!r.ok) throw new Error(`read ${rel} ${r.status}`);
+      const text = await r.text();
+      if (!text) return fallback;
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        throw new Error(`parse ${rel}: ${e.message}`);
+      }
+    }
+
+    async function commitFiles(message, files) {
+      if (!files.length) throw new Error("nothing to commit");
+      const body = {
+        message: message || "list-runner update",
+        overwrite: true,
+        files: files.map(f => ({
+          path: f.path.startsWith("items/") ? f.path : `items/${f.path}`,
+          content_base64: Buffer.from(
+            typeof f.raw === "string"
+              ? f.raw
+              : JSON.stringify(f.json, null, 2) + "\n",
+            "utf8"
+          ).toString("base64"),
+          content_type: "application/json"
+        }))
+      };
+      const url = `${baseUrl}/items/commit-bulk`;
+      const r = await fetchWithRetry(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const out = await r.json().catch(() => ({}));
+      if (!r.ok || out.ok === false) {
+        throw new Error(out.error || `commit-bulk ${r.status}`);
+      }
+      return out;
+    }
+
+    function runExpeditor() {
+      return new Promise((resolve, reject) => {
+        execFile(
+          "node",
+          [`items/${ROOT}/expeditor.js`, "update"],
+          { timeout: 15000 },
+          (err, stdout, stderr) => {
+            if (err) return reject(new Error(stderr || err.message));
+            resolve(stdout || "");
+          }
+        );
+      });
+    }
+
+    function toMs(iso) {
+      if (!iso) return NaN;
+      const t = Date.parse(iso);
+      return Number.isNaN(t) ? NaN : t;
+    }
+
+    // choose active show: inside, pre-pack (1–3d), next upcoming; allow explicit id/name from command
+    function resolveActiveShow(schedule, state, cmd, isoNow) {
+      const shows = Array.isArray(schedule?.shows) ? schedule.shows : [];
+      if (!shows.length) return null;
+
+      const lower = cmd.toLowerCase();
+      const nowMs = toMs(isoNow);
+
+      // explicit: "use show 7129" or "#7129"
+      let m = lower.match(/show\s+(\d{3,})/);
+      if (!m) m = lower.match(/#(\d{3,})/);
+      if (m) {
+        const id = m[1];
+        const byId = shows.find(s =>
+          String(s.show_id) === id ||
+          (s.show_name && s.show_name.includes(`#${id}`))
+        );
+        if (byId) return byId;
+      }
+
+      // explicit by name fragment (rough)
+      const nameHit = shows.find(s => {
+        if (!s.show_name) return false;
+        const base = s.show_name.split("(")[0].trim().toLowerCase();
+        return base && lower.includes(base);
+      });
+      if (nameHit) return nameHit;
+
+      // inside a show
+      for (const s of shows) {
+        const start = toMs(s.start_date);
+        const end = toMs(s.end_date);
+        if (!Number.isNaN(start) && !Number.isNaN(end) && nowMs >= start && nowMs <= end) {
+          return s;
+        }
+      }
+
+      // pre-pack window 1–3 days before
+      let pre = null;
+      for (const s of shows) {
+        const start = toMs(s.start_date);
+        if (Number.isNaN(start) || start <= nowMs) continue;
+        const diffDays = (start - nowMs) / 86400000;
+        if (diffDays >= 1 && diffDays <= 3) {
+          if (!pre || start < toMs(pre.start_date)) pre = s;
+        }
+      }
+      if (pre) return pre;
+
+      // next upcoming
+      let next = null;
+      for (const s of shows) {
+        const start = toMs(s.start_date);
+        if (Number.isNaN(start) || start < nowMs) continue;
+        if (!next || start < toMs(next.start_date)) next = s;
+      }
+      if (next) return next;
+
+      // fallback: prior active_show_id if still exists
+      if (state?.active_show_id) {
+        const prev = shows.find(s => String(s.show_id) === String(state.active_show_id));
+        if (prev) return prev;
+      }
+
+      // final fallback
+      return shows[0];
+    }
+
+    // canonicalize status words
+    function normalizeStatus(word) {
+      const w = (word || "").toLowerCase().replace(/[_-]+/g, " ").trim();
+      if (w === "packed") return "packed";
+      if (w === "not packed" || w === "unpacked") return "not_packed";
+      if (w === "not needed" || w === "noneeded" || w === "no need") return "not_needed";
+      if (w === "missing") return "missing";
+      if (w === "broken") return "broken";
+      if (w === "left over" || w === "leftover" || w === "left over there") return "left_over";
+      if (w === "sent back early" || w === "sent back" || w === "sent early") return "sent_back_early";
+      if (w === "reset") return "reset";
+      return null;
+    }
+
+    // parse a natural command into action + args
+    function parseCommand(cmd) {
+      const raw = cmd.trim();
+      const lower = raw.toLowerCase();
+
+      // 1) add <item> to <list>
+      let m = lower.match(/^add\s+(.+?)\s+to\s+(tack|equipment|feed)\b/);
+      if (m) {
+        return {
+          action: "add_item",
+          item_name: raw.slice(m.index + 4, m.index + 4 + m[1].length).trim(),
+          list_name: m[2]
+        };
+      }
+
+      // 2) mark <item> <status> [by X]
+      m = lower.match(/^mark\s+(.+?)\s+(packed|not\s+packed|not\s+needed|missing|broken|left\s*over|leftover|sent\s+back(?:\s+early)?|reset)(?:\s+by\s+(.+))?$/);
+      if (m) {
+        const itemRaw = raw.slice(m.index + 5, m.index + 5 + m[1].length).trim();
+        const statusWord = m[2];
+        const confirmByRaw = m[3] ? raw.substring(raw.toLowerCase().indexOf(m[3])).replace(/^by\s+/i, "").trim() : null;
+        const status = normalizeStatus(statusWord);
+        if (!status) return { action: null };
+        return {
+          action: status === "reset" ? "reset_item" : "set_status",
+          item_name: itemRaw,
+          status,
+          confirm_by: confirmByRaw || null
+        };
+      }
+
+      // 3) bulk pack to_take
+      if (lower.includes("make sure") && lower.includes("packed") && lower.includes("take")) {
+        return { action: "bulk_pack_to_take" };
+      }
+
+      // 4) bulk pack to_bring_home
+      if (
+        lower.includes("make sure") &&
+        lower.includes("packed") &&
+        (lower.includes("leave") || lower.includes("home"))
+      ) {
+        return { action: "bulk_pack_to_bring_home" };
+      }
+
+      return { action: null };
+    }
+
+    // ensure show node + default lists under started_lists.json
+    function ensureShow(started, show) {
+      if (!started.shows) started.shows = {};
+      const key = String(show.show_id);
+      if (!started.shows[key]) {
+        started.shows[key] = {
+          show_id: show.show_id,
+          show_name: show.show_name,
+          start_date: show.start_date,
+          end_date: show.end_date,
+          state: "home",
+          lists: {}
+        };
+      }
+      const s = started.shows[key];
+      if (!s.lists) s.lists = {};
+      for (const name of ["tack", "equipment", "feed"]) {
+        if (!s.lists[name]) s.lists[name] = [];
+      }
+      return { key, showState: s };
+    }
+
+    function ensureStateScaffold(state) {
+      if (!state.devices) state.devices = {};
+      if (!state.items) state.items = {};
+    }
+
+    function touchDevice(state, device_id, ip, ts) {
+      ensureStateScaffold(state);
+      if (!state.devices[device_id]) state.devices[device_id] = {};
+      state.devices[device_id].last_seen = ts;
+      if (ip) state.devices[device_id].last_ip = ip;
+    }
+
+    // item registry lookup: uses lists/item_registry.json (array of objects)
+    function buildItemRegistryMap(reg) {
+      const map = {};
+      if (!Array.isArray(reg)) return map;
+      for (const e of reg) {
+        if (!e || !e.name) continue;
+        const key = e.name.toLowerCase();
+        map[key] = e;
+        if (Array.isArray(e.aliases)) {
+          for (const a of e.aliases) {
+            if (a) map[a.toLowerCase()] = e;
+          }
+        }
+        if (Array.isArray(e.mispells)) {
+          for (const m of e.mispells) {
+            if (m) map[m.toLowerCase()] = e;
+          }
+        }
+      }
+      return map;
+    }
+
+    function resolveItemDefinition(name, listName, regMap) {
+      const n = name.toLowerCase();
+      const hit = regMap[n];
+      if (hit) {
+        return {
+          name: hit.name || name,
+          type: hit.type || listName || null,
+          subtype: hit.subtype || null,
+          note: hit.note || null
+        };
+      }
+      // default from list name
+      let type = null;
+      if (listName === "tack") type = "tack";
+      else if (listName === "equipment") type = "equipment";
+      else if (listName === "feed") type = "feed";
+      return { name, type, subtype: null, note: null };
+    }
+
+    function globalItemStatus(state, itemName) {
+      ensureStateScaffold(state);
+      const k = itemName.toLowerCase();
+      return state.items[k] || null;
+    }
+
+    function setGlobalItemStatus(state, itemName, status, where, ts) {
+      ensureStateScaffold(state);
+      const k = itemName.toLowerCase();
+      if (!state.items[k]) state.items[k] = { name: itemName };
+      if (status === "reset" || status === "packed" || status === "not_packed" || status === "not_needed") {
+        // treat as cleared / ok
+        state.items[k].status = "ok";
+        state.items[k].where = where || null;
+      } else {
+        state.items[k].status = status;
+        state.items[k].where = where || null;
+      }
+      state.items[k].updated_at = ts;
+    }
+
+    function addItemToList(showState, listName, itemName, regMap, state, ts) {
+      const lname = listName.toLowerCase();
+      const list = showState.lists[lname] || (showState.lists[lname] = []);
+
+      // block if globally missing/broken unless reset
+      const global = globalItemStatus(state, itemName);
+      if (global && (global.status === "missing" || global.status === "broken")) {
+        return { added: false, blocked: true, reason: global.status };
+      }
+
+      const exists = list.some(
+        it => (it.name || "").toLowerCase() === itemName.toLowerCase()
+      );
+      if (exists) return { added: false, blocked: false };
+
+      const def = resolveItemDefinition(itemName, lname, regMap);
+      const id = `itm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+      list.push({
+        id,
+        name: def.name,
+        type: def.type,
+        subtype: def.subtype,
+        note: def.note,
+        created_at: ts,
+        to_take: "not_packed",
+        to_bring_home: null,
+        history: [
+          { ts, action: "create", by: device_id }
+        ]
+      });
+
+      // initialize global status as ok/home
+      setGlobalItemStatus(state, def.name, "ok", "home", ts);
+
+      return { added: true, blocked: false };
+    }
+
+    function findItemOnShow(showState, itemName) {
+      const needle = itemName.toLowerCase();
+      let found = null;
+      for (const [lname, arr] of Object.entries(showState.lists || {})) {
+        for (let i = 0; i < arr.length; i++) {
+          const it = arr[i];
+          if ((it.name || "").toLowerCase() === needle) {
+            if (found) {
+              return { error: "ambiguous" };
+            }
+            found = { listName: lname, index: i, item: it };
+          }
+        }
+      }
+      if (!found) return { error: "not_found" };
+      return found;
+    }
+
+    function applyStatusToItem(showState, state, parsed, ts) {
+      const { item_name, status, confirm_by } = parsed;
+      const located = findItemOnShow(showState, item_name);
+      if (located.error) return { changed: false, error: located.error };
+
+      const { listName, index, item } = located;
+      const showMode = showState.state || "home";
+      const key = (showMode === "away" || showMode === "complete")
+        ? "to_bring_home"
+        : "to_take";
+
+      if (status === "reset") {
+        const prev = item[key];
+        item[key] = "not_packed";
+        if (!item.history) item.history = [];
+        item.history.push({
+          ts,
+          action: "reset",
+          from: prev || null,
+          to: item[key],
+          by: confirm_by || device_id
+        });
+        setGlobalItemStatus(state, item.name, "ok", null, ts);
+        return { changed: true, listName, item };
+      }
+
+      const canonical = status;
+      const prev = item[key] || null;
+      if (prev === canonical) {
+        return { changed: false, listName, item };
+      }
+
+      item[key] = canonical;
+      if (!item.history) item.history = [];
+      item.history.push({
+        ts,
+        action: "set_status",
+        field: key,
+        from: prev,
+        to: canonical,
+        by: confirm_by || device_id
+      });
+
+      // update global status on serious outcomes
+      if (["missing", "broken", "left_over", "sent_back_early"].includes(canonical)) {
+        const where =
+          canonical === "left_over"
+            ? `show:${showState.show_id || ""}`
+            : null;
+        setGlobalItemStatus(state, item.name, canonical, where, ts);
+      } else if (canonical === "packed" || canonical === "not_needed") {
+        // packed/not_needed tends toward ok; we do not force where
+        setGlobalItemStatus(state, item.name, canonical, null, ts);
+      }
+
+      return { changed: true, listName, item };
+    }
+
+    function bulkPack(showState, state, mode, ts) {
+      let count = 0;
+      const key = mode === "to_bring_home" ? "to_bring_home" : "to_take";
+      for (const arr of Object.values(showState.lists || {})) {
+        for (const it of arr) {
+          if (it[key] === "not_packed") {
+            const prev = it[key];
+            it[key] = "packed";
+            if (!it.history) it.history = [];
+            it.history.push({
+              ts,
+              action: "bulk_pack",
+              field: key,
+              from: prev,
+              to: "packed",
+              by: device_id
+            });
+            setGlobalItemStatus(state, it.name, "packed", null, ts);
+            count++;
+          }
+        }
+      }
+      return count;
+    }
+
+    function summarize(showState) {
+      let total = 0;
+      let to_take_unpacked = 0;
+      let to_bring_home_unpacked = 0;
+      for (const arr of Object.values(showState.lists || {})) {
+        for (const it of arr) {
+          total++;
+          if (it.to_take === "not_packed") to_take_unpacked++;
+          if (it.to_bring_home === "not_packed") to_bring_home_unpacked++;
+        }
+      }
+      return { total_items: total, to_take_unpacked, to_bring_home_unpacked };
+    }
+
+    function autoArchiveOldShows(started, archived, ts) {
+      const nowMs = toMs(ts);
+      if (!started.shows) return;
+      if (!archived.shows) archived.shows = {};
+      for (const [key, s] of Object.entries(started.shows)) {
+        const end = toMs(s.end_date);
+        if (Number.isNaN(end)) continue;
+        const diffDays = (nowMs - end) / 86400000;
+        if (diffDays >= 3) {
+          archived.shows[key] = s;
+          delete started.shows[key];
+        }
+      }
+    }
+
+    // ---------- load current state ----------
+    const [stateRaw, schedule, startedRaw, archivedRaw, updatesRaw, itemRegRaw] =
+      await Promise.all([
+        readJson(`${ROOT}/state.json`, {}),
+        readJson(`${ROOT}/shows/show_schedule.json`, { shows: [] }),
+        readJson(`${ROOT}/lists/started_lists.json`, { shows: {} }),
+        readJson(`${ROOT}/lists/archived_lists.json`, { shows: {} }),
+        readJson(`${ROOT}/logs/updates.json`, { events: [] }),
+        readJson(`${ROOT}/lists/item_registry.json`, [])
+      ]);
+
+    const state = stateRaw || {};
+    const started = startedRaw || { shows: {} };
+    const archived = archivedRaw || { shows: {} };
+    const updates = updatesRaw || { events: [] };
+    if (!Array.isArray(updates.events)) updates.events = [];
+
+    touchDevice(state, device_id, req.ip, ts);
+
+    const regMap = buildItemRegistryMap(itemRegRaw);
+    const activeShow = resolveActiveShow(schedule, state, command, ts);
+    if (!activeShow) {
+      return res.status(500).json({ ok: false, error: "no shows in schedule" });
+    }
+
+    const parsed = parseCommand(command);
+    if (!parsed.action) {
+      return res.status(400).json({ ok: false, error: "unsupported command" });
+    }
+
+    const { key: showKey, showState } = ensureShow(started, activeShow);
+
+    // ---------- apply command ----------
+    let actionLabel = parsed.action;
+    let bulkCount = 0;
+    let changed = false;
+    let errorDetail = null;
+
+    if (parsed.action === "add_item") {
+      const out = addItemToList(showState, parsed.list_name, parsed.item_name, regMap, state, ts);
+      if (out.blocked) {
+        actionLabel = `blocked_${out.reason}`;
+        errorDetail = `item locked as ${out.reason}`;
+      } else if (out.added) {
+        changed = true;
+      } else {
+        actionLabel = "noop_item_exists";
+      }
+    } else if (parsed.action === "set_status") {
+      const r = applyStatusToItem(showState, state, parsed, ts);
+      if (r.error === "not_found") {
+        return res.status(400).json({ ok: false, error: "item not found" });
+      }
+      if (r.error === "ambiguous") {
+        return res.status(400).json({ ok: false, error: "item ambiguous" });
+      }
+      changed = r.changed;
+    } else if (parsed.action === "reset_item") {
+      const r = applyStatusToItem(showState, state, parsed, ts);
+      if (r.error === "not_found") {
+        return res.status(400).json({ ok: false, error: "item not found" });
+      }
+      if (r.error === "ambiguous") {
+        return res.status(400).json({ ok: false, error: "item ambiguous" });
+      }
+      changed = r.changed;
+    } else if (parsed.action === "bulk_pack_to_take") {
+      bulkCount = bulkPack(showState, state, "to_take", ts);
+      changed = bulkCount > 0;
+    } else if (parsed.action === "bulk_pack_to_bring_home") {
+      bulkCount = bulkPack(showState, state, "to_bring_home", ts);
+      changed = bulkCount > 0;
+    }
+
+    // update state header
+    state.active_show_id = activeShow.show_id;
+    state.active_show_name = activeShow.show_name;
+    state.updated_at = ts;
+
+    // auto-archive by age (3+ days after end)
+    autoArchiveOldShows(started, archived, ts);
+
+    // log event (even if no-op)
+    const files_touched = [
+      `${ROOT}/state.json`,
+      `${ROOT}/lists/started_lists.json`,
+      `${ROOT}/logs/updates.json`
+    ];
+    const event = {
+      ts,
+      device_id,
+      ip: req.ip,
+      show_id: activeShow.show_id,
+      show_name: activeShow.show_name,
+      show_key: showKey,
+      command_raw: command,
+      action: actionLabel,
+      bulk_count: bulkCount,
+      error: errorDetail || null,
+      files_touched,
+      success: errorDetail ? false : true
+    };
+    updates.events.push(event);
+
+    // prepare commits
+    const files = [
+      { path: `items/${ROOT}/state.json`, json: state },
+      { path: `items/${ROOT}/lists/started_lists.json`, json: started },
+      { path: `items/${ROOT}/logs/updates.json`, json: updates }
+    ];
+    if (archived && Object.keys(archived.shows || {}).length) {
+      files.push({
+        path: `items/${ROOT}/lists/archived_lists.json`,
+        json: archived
+      });
+    }
+
+    await commitFiles("list-runner command", files);
+
+    // run expeditor to refresh lists/index.json etc.
+    try {
+      await runExpeditor();
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: `expeditor failed: ${e.message}` });
+    }
+
+    const counts = summarize(showState);
+    const resp = {
+      ok: !errorDetail,
+      show_id: activeShow.show_id,
+      show_name: activeShow.show_name,
+      action: actionLabel,
+      bulk_count: bulkCount || undefined,
+      counts
+    };
+    if (errorDetail) resp.error = errorDetail;
+    if (debug) {
+      resp.debug = { parsed, event };
+    }
 
     return res.json(resp);
   } catch (e) {
