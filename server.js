@@ -6,6 +6,8 @@ import fetch from "node-fetch";
 import cors from "cors";
 import morgan from "morgan";
 import dotenv from "dotenv";
+import { execFile } from "child_process";
+
 dotenv.config();
 
 const app = express();
@@ -596,6 +598,375 @@ app.all("/items/commit-simple", async (req, res) => {
     res.status(commit.status).json(result);
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+// --- /items/agents/list-runner/command --- primary List-Runner write surface ---
+app.post("/items/agents/list-runner/command", async (req, res) => {
+  try {
+    const { device_id, command, now, debug } = req.body || {};
+    if (!device_id || !command) {
+      return res.status(400).json({ ok: false, error: "device_id and command required" });
+    }
+
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const ts = typeof now === "string" ? now : new Date().toISOString();
+    const ROOT = "agents/list-runner";
+
+    // helpers
+    async function readJson(rel) {
+      const url = `${baseUrl}/items/${rel}`;
+      const r = await fetchWithRetry(url, { method: "GET" });
+      if (r.status === 404) return null;
+      if (!r.ok) throw new Error(`read ${rel} ${r.status}`);
+      const text = await r.text();
+      if (!text) return null;
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        throw new Error(`parse ${rel}: ${e.message}`);
+      }
+    }
+
+    async function commitFiles(message, files) {
+      if (!files.length) {
+        throw new Error("nothing to commit");
+      }
+      const body = {
+        message: message || "list-runner update",
+        overwrite: true,
+        files: files.map(f => ({
+          path: f.path.startsWith("items/") ? f.path : `items/${f.path}`,
+          content_base64: Buffer.from(
+            typeof f.raw === "string" ? f.raw : JSON.stringify(f.json, null, 2) + "\n",
+            "utf8"
+          ).toString("base64"),
+          content_type: "application/json"
+        }))
+      };
+      const url = `${baseUrl}/items/commit-bulk`;
+      const r = await fetchWithRetry(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body)
+      });
+      const out = await r.json().catch(() => ({}));
+      if (!r.ok || out.ok === false) {
+        throw new Error(out.error || `commit-bulk failed (${r.status})`);
+      }
+      return out;
+    }
+
+    function resolveWeekStart(stateObj, isoNow) {
+      if (stateObj && typeof stateObj.active_week_start === "string") {
+        return stateObj.active_week_start;
+      }
+      const d = new Date(isoNow);
+      d.setUTCDate(d.getUTCDate() + 1); // week starting tomorrow
+      const yyyy = d.getUTCFullYear();
+      const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+      const dd = String(d.getUTCDate()).padStart(2, "0");
+      return `${yyyy}-${mm}-${dd}`;
+    }
+
+    function parseCommand(cmd) {
+      const lower = cmd.toLowerCase().trim();
+      const out = { action: null, list: null, item: null, direction: null, bulk: false };
+
+      // add <item> to <list>
+      let m = lower.match(/^add\s+(.+?)\s+to\s+(tack|equipment|feed)\b/);
+      if (m) {
+        out.action = "add_item";
+        out.item = m[1].trim();
+        out.list = m[2];
+        out.direction = "to_take";
+        return out;
+      }
+
+      // mark <item> to bring home / to take
+      m = lower.match(/^mark\s+(.+?)\s+to\s+(bring home|take)\b/);
+      if (m) {
+        out.action = "set_status";
+        out.item = m[1].trim();
+        out.direction = m[2] === "bring home" ? "to_bring_home" : "to_take";
+        return out;
+      }
+
+      // bulk pack to_take
+      if (lower.includes("make sure") && lower.includes("packed") && lower.includes("take")) {
+        out.action = "bulk_pack_take";
+        out.direction = "to_take";
+        out.bulk = true;
+        return out;
+      }
+
+      // bulk pack to_bring_home
+      if (
+        lower.includes("make sure") &&
+        lower.includes("packed") &&
+        (lower.includes("leave") || lower.includes("home"))
+      ) {
+        out.action = "bulk_pack_home";
+        out.direction = "to_bring_home";
+        out.bulk = true;
+        return out;
+      }
+
+      return out;
+    }
+
+    function ensureWeekContainers(started, week_start) {
+      if (!started.weeks) started.weeks = {};
+      if (!started.weeks[week_start]) {
+        started.weeks[week_start] = { lists: {} };
+      }
+      const week = started.weeks[week_start];
+      if (!week.lists) week.lists = {};
+      for (const name of ["tack", "equipment", "feed"]) {
+        if (!week.lists[name]) week.lists[name] = [];
+      }
+      return week;
+    }
+
+    function findItemRef(week, targetName, listHint) {
+      if (!targetName) return null;
+      const needle = targetName.toLowerCase().trim();
+      if (listHint && week.lists[listHint]) {
+        const arr = week.lists[listHint];
+        for (let i = 0; i < arr.length; i++) {
+          if ((arr[i].name || "").toLowerCase() === needle) {
+            return { list: listHint, index: i };
+          }
+        }
+      }
+      let found = null;
+      for (const [lname, arr] of Object.entries(week.lists || {})) {
+        for (let i = 0; i < arr.length; i++) {
+          if ((arr[i].name || "").toLowerCase() === needle) {
+            if (found) return null; // ambiguous
+            found = { list: lname, index: i };
+          }
+        }
+      }
+      return found;
+    }
+
+    function autoArchiveIfComplete(started, archived, week_start) {
+      const w = started.weeks && started.weeks[week_start];
+      if (!w || !w.lists) return { archivedChanged: false };
+      let hasHome = false;
+      let allHomePacked = true;
+      for (const arr of Object.values(w.lists)) {
+        for (const it of arr) {
+          if (it.status === "to_bring_home") {
+            hasHome = true;
+            if (!it.packed_home) allHomePacked = false;
+          }
+        }
+      }
+      if (hasHome && allHomePacked) {
+        if (!archived.weeks) archived.weeks = {};
+        archived.weeks[week_start] = w;
+        delete started.weeks[week_start];
+        return { archivedChanged: true };
+      }
+      return { archivedChanged: false };
+    }
+
+    async function runExpeditor() {
+      return new Promise((resolve, reject) => {
+        execFile(
+          "node",
+          [`items/${ROOT}/expeditor.js`, "update"],
+          { timeout: 15000 },
+          (err, stdout, stderr) => {
+            if (err) return reject(new Error(stderr || err.message));
+            return resolve(stdout || "");
+          }
+        );
+      });
+    }
+
+    // ----- load current state -----
+    const state = (await readJson(`${ROOT}/state.json`)) || {};
+    const updates = (await readJson(`${ROOT}/logs/updates.json`)) || { events: [] };
+    const started = (await readJson(`${ROOT}/lists/started_lists.json`)) || { weeks: {} };
+    const archived = (await readJson(`${ROOT}/lists/archived_lists.json`)) || { weeks: {} };
+
+    const week_start = resolveWeekStart(state, ts);
+    const parsed = parseCommand(command);
+    if (!parsed.action) {
+      return res.status(400).json({ ok: false, error: "unsupported command" });
+    }
+
+    // ensure week + lists
+    const week = ensureWeekContainers(started, week_start);
+
+    let filesToCommit = [];
+    let affected = [];
+    let status_before = null;
+    let status_after = null;
+
+    if (parsed.action === "add_item") {
+      const lname = parsed.list;
+      const displayName = parsed.item;
+      const exists = (week.lists[lname] || []).some(
+        it => (it.name || "").toLowerCase() === displayName.toLowerCase()
+      );
+      if (!exists) {
+        week.lists[lname].push({
+          name: displayName,
+          status: parsed.direction || "to_take",
+          packed_take: false,
+          packed_home: false
+        });
+        affected.push({ list: lname, item: displayName });
+      }
+    } else if (parsed.action === "set_status") {
+      const ref = findItemRef(week, parsed.item, parsed.list);
+      if (!ref) {
+        return res.status(400).json({ ok: false, error: "item not found or ambiguous" });
+      }
+      const it = week.lists[ref.list][ref.index];
+      status_before = it.status || null;
+      it.status = parsed.direction;
+      if (parsed.direction === "to_take") {
+        it.packed_take = false;
+      } else if (parsed.direction === "to_bring_home") {
+        it.packed_home = false;
+      }
+      status_after = it.status;
+      affected.push({ list: ref.list, item: it.name });
+    } else if (parsed.action === "bulk_pack_take") {
+      let changed = 0;
+      for (const arr of Object.values(week.lists)) {
+        for (const it of arr) {
+          if (it.status === "to_take" && !it.packed_take) {
+            it.packed_take = true;
+            changed++;
+          }
+        }
+      }
+      if (changed === 0) {
+        return res.json({ ok: true, week_start, action: parsed.action, counts: { packed: 0 }, note: "nothing to pack for that direction" });
+      }
+      affected.push({ bulk: true, direction: "to_take" });
+    } else if (parsed.action === "bulk_pack_home") {
+      let changed = 0;
+      for (const arr of Object.values(week.lists)) {
+        for (const it of arr) {
+          if (it.status === "to_bring_home" && !it.packed_home) {
+            it.packed_home = true;
+            changed++;
+          }
+        }
+      }
+      if (changed === 0) {
+        return res.json({ ok: true, week_start, action: parsed.action, counts: { packed: 0 }, note: "nothing to pack for that direction" });
+      }
+      affected.push({ bulk: true, direction: "to_bring_home" });
+    }
+
+    // update state with active week
+    state.active_week_start = week_start;
+
+    // auto-archive if completed bring-home
+    const { archivedChanged } = autoArchiveIfComplete(started, archived, week_start);
+
+    // build log event
+    const files_touched = [
+      `${ROOT}/state.json`,
+      `${ROOT}/lists/started_lists.json`,
+      `${ROOT}/logs/updates.json`
+    ];
+    if (archivedChanged) {
+      files_touched.push(`${ROOT}/lists/archived_lists.json`);
+    }
+    const event = {
+      ts,
+      device_id,
+      week_start,
+      command_raw: command,
+      action: parsed.action,
+      list: parsed.list || null,
+      item: parsed.item || null,
+      direction: parsed.direction || null,
+      status_before,
+      status_after,
+      files_touched,
+      success: true
+    };
+    if (!Array.isArray(updates.events)) updates.events = [];
+    updates.events.push(event);
+
+    // prepare commit payloads
+    filesToCommit.push({
+      path: `items/${ROOT}/state.json`,
+      json: state
+    });
+    filesToCommit.push({
+      path: `items/${ROOT}/lists/started_lists.json`,
+      json: started
+    });
+    filesToCommit.push({
+      path: `items/${ROOT}/logs/updates.json`,
+      json: updates
+    });
+    if (archivedChanged) {
+      filesToCommit.push({
+        path: `items/${ROOT}/lists/archived_lists.json`,
+        json: archived
+      });
+    }
+
+    // commit
+    await commitFiles("list-runner update", filesToCommit);
+
+    // run expeditor
+    try {
+      await runExpeditor();
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: `expeditor failed: ${e.message}` });
+    }
+
+    // summary counts (simple)
+    let total_items = 0;
+    let to_take_unpacked = 0;
+    let to_bring_home_unpacked = 0;
+    const w2 = (started.weeks && started.weeks[week_start]) || week;
+    if (w2 && w2.lists) {
+      for (const arr of Object.values(w2.lists)) {
+        for (const it of arr) {
+          total_items++;
+          if (it.status === "to_take" && !it.packed_take) to_take_unpacked++;
+          if (it.status === "to_bring_home" && !it.packed_home) to_bring_home_unpacked++;
+        }
+      }
+    }
+
+    const resp = {
+      ok: true,
+      week_start,
+      action: parsed.action,
+      list: parsed.list || null,
+      item: parsed.item || null,
+      direction: parsed.direction || null,
+      counts: {
+        total_items,
+        to_take_unpacked,
+        to_bring_home_unpacked
+      }
+    };
+    if (debug) {
+      resp.debug = {
+        parsed,
+        affected,
+        files_touched
+      };
+    }
+    return res.json(resp);
+  } catch (e) {
+    console.error("list-runner/command error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
