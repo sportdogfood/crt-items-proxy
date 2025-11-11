@@ -9,6 +9,8 @@ import dotenv from "dotenv";
 import { execFile } from "child_process";
 dotenv.config();
 
+
+
 const app = express();
 
 // --- Environment setup ---
@@ -557,703 +559,10 @@ app.post("/items/commit-bulk", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
-// --- /items/agents/list-runner/command --- mobile-friendly List-Runner surface ---
-app.post("/items/agents/list-runner/command", async (req, res) => {
-  try {
-    const { device_id, command, actor, now, debug } = req.body || {};
-    if (!device_id || !command) {
-      return res.status(400).json({ ok: false, error: "device_id and command required" });
-    }
-
-    const baseUrl = `${req.protocol}://${req.get("host")}`;
-    const ts = typeof now === "string" ? now : new Date().toISOString();
-    const ROOT = "agents/list-runner";
-
-    // --- helpers (scoped to this route) ---
-
-    function uid() {
-      return (
-        "lr_" +
-        Date.now().toString(36) +
-        "_" +
-        Math.random().toString(36).slice(2, 8)
-      );
-    }
-
-    async function readJson(rel, fallback) {
-      const url = `${baseUrl}/items/${rel}`;
-      const r = await fetchWithRetry(url, { method: "GET" });
-      if (r.status === 404) return fallback;
-      if (!r.ok) throw new Error(`read ${rel} ${r.status}`);
-      const text = await r.text();
-      if (!text) return fallback;
-      try {
-        return JSON.parse(text);
-      } catch (e) {
-        throw new Error(`parse ${rel}: ${e.message}`);
-      }
-    }
-
-    async function commitBulk(message, files) {
-      if (!files || !files.length) {
-        throw new Error("nothing to commit");
-      }
-      const body = {
-        message: message || "list-runner update",
-        overwrite: true,
-        files: files.map(f => ({
-          path: f.path,
-          content_base64: Buffer.from(
-            typeof f.json === "string" ? f.json : JSON.stringify(f.json, null, 2) + "\n",
-            "utf8"
-          ).toString("base64"),
-          content_type: "application/json"
-        }))
-      };
-      const url = `${baseUrl}/items/commit-bulk`;
-      const r = await fetchWithRetry(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body)
-      });
-      const out = await r.json().catch(() => ({}));
-      if (!r.ok || out.ok === false) {
-        throw new Error(out.error || `commit-bulk failed (${r.status})`);
-      }
-      return out;
-    }
-
-    function normalizeListName(name, listRegistry) {
-      if (!name) return null;
-      const key = name.toLowerCase().trim();
-      // direct
-      if (listRegistry[key]) return key;
-      // aliases/misspells
-      for (const [lname, meta] of Object.entries(listRegistry)) {
-        const { aliases = [], mispells = [] } = meta || {};
-        if (
-          aliases.some(a => a.toLowerCase() === key) ||
-          mispells.some(a => a.toLowerCase() === key)
-        ) {
-          return lname;
-        }
-      }
-      return null;
-    }
-
-    function normalizeItemName(name, itemRegistry) {
-      if (!name) return { canonical: name, blocked: false };
-      const key = name.toLowerCase().trim();
-      for (const [iname, meta] of Object.entries(itemRegistry || {})) {
-        if (iname.toLowerCase() === key) {
-          return { canonical: iname, blocked: !!meta.blocked };
-        }
-        const { aliases = [], mispells = [], nicknames = [] } = meta || {};
-        if (
-          aliases.concat(mispells, nicknames || []).some(a => a.toLowerCase() === key)
-        ) {
-          return { canonical: iname, blocked: !!meta.blocked };
-        }
-      }
-      return { canonical: name, blocked: false };
-    }
-
-    function pickStatusToken(raw) {
-      const v = raw.toLowerCase();
-      if (v === "packed") return "packed";
-      if (v === "not_packed" || v === "unpacked") return "not_packed";
-      if (v === "notneeded" || v === "not_needed") return "not_needed";
-      if (v === "missing") return "missing";
-      if (v === "broken") return "broken";
-      if (v === "left_over" || v === "leftover") return "left_over";
-      if (v === "sent_back_early" || v === "sent-back-early") return "sent_back_early";
-      return null;
-    }
-
-    function parseCommand(input, listRegistry) {
-      const text = String(input).trim();
-      const lower = text.toLowerCase();
-
-      // add <item> to <list>
-      let m = lower.match(/^add\s+(.+?)\s+to\s+([a-z0-9 _-]+)$/);
-      if (m) {
-        return {
-          kind: "add_item",
-          raw_item: m[1].trim(),
-          raw_list: m[2].trim()
-        };
-      }
-
-      // mark <item> as <status>
-      m = lower.match(/^mark\s+(.+?)\s+as\s+([a-z_ -]+)$/);
-      if (m) {
-        return {
-          kind: "item_status",
-          raw_item: m[1].trim(),
-          raw_status: m[2].trim()
-        };
-      }
-
-      // mark <item> <status>
-      m = lower.match(/^mark\s+(.+?)\s+([a-z_ -]+)$/);
-      if (m) {
-        return {
-          kind: "item_status",
-          raw_item: m[1].trim(),
-          raw_status: m[2].trim()
-        };
-      }
-
-      // mark <list> away
-      m = lower.match(/^mark\s+([a-z0-9 _-]+)\s+away$/);
-      if (m) {
-        return {
-          kind: "list_state",
-          raw_list: m[1].trim(),
-          list_state: "away"
-        };
-      }
-
-      // mark <list> complete
-      m = lower.match(/^mark\s+([a-z0-9 _-]+)\s+complete$/);
-      if (m) {
-        return {
-          kind: "list_state",
-          raw_list: m[1].trim(),
-          list_state: "complete"
-        };
-      }
-
-      // show <list>
-      m = lower.match(/^show\s+(?:me\s+)?(?:my\s+)?([a-z0-9 _-]+)\s+list$/);
-      if (m) {
-        return {
-          kind: "show_list",
-          raw_list: m[1].trim()
-        };
-      }
-
-      // summary
-      if (lower === "summary" || lower === "show summary") {
-        return { kind: "summary" };
-      }
-
-      return { kind: "unsupported" };
-    }
-
-    function selectActiveShow(showsData, isoNow) {
-      if (!showsData || !Array.isArray(showsData.shows)) return null;
-      const nowDate = new Date(isoNow);
-      let candidate = null;
-
-      for (const show of showsData.shows) {
-        if (!show.start_date || !show.end_date) continue;
-        const s = new Date(show.start_date);
-        const e = new Date(show.end_date);
-
-        // active window: start - 1 day to end + 3 days
-        const pre = new Date(s);
-        pre.setUTCDate(pre.getUTCDate() - 1);
-        const post = new Date(e);
-        post.setUTCDate(post.getUTCDate() + 3);
-
-        if (nowDate >= pre && nowDate <= post) {
-          if (!candidate || new Date(candidate.start_date) < s) {
-            candidate = show;
-          }
-        }
-      }
-
-      if (candidate) return candidate;
-
-      // otherwise next upcoming
-      let nextShow = null;
-      for (const show of showsData.shows) {
-        if (!show.start_date) continue;
-        const s = new Date(show.start_date);
-        if (s > nowDate) {
-          if (!nextShow || s < new Date(nextShow.start_date)) {
-            nextShow = show;
-          }
-        }
-      }
-      return nextShow;
-    }
-
-    function ensureShowContainer(started, show) {
-      if (!started.version) started.version = "1.0";
-      if (!started.shows) started.shows = {};
-      const key = String(show.show_id);
-      if (!started.shows[key]) {
-        started.shows[key] = {
-          show_id: show.show_id,
-          show_name: show.show_name,
-          start_date: show.start_date,
-          end_date: show.end_date,
-          state: "home",
-          lists: {}
-        };
-      }
-      return started.shows[key];
-    }
-
-    function ensureList(showEntry, listName) {
-      if (!showEntry.lists[listName]) {
-        showEntry.lists[listName] = {
-          name: listName,
-          state: showEntry.state === "away" ? "away" : "home",
-          items: []
-        };
-      }
-      return showEntry.lists[listName];
-    }
-
-    function findItem(list, name) {
-      const key = name.toLowerCase();
-      const items = list.items || [];
-      for (let i = 0; i < items.length; i++) {
-        if ((items[i].name || "").toLowerCase() === key) {
-          return { index: i, item: items[i] };
-        }
-      }
-      return null;
-    }
-
-    function applyItemStatus(list, item, statusToken) {
-      const before = {
-        to_take: item.to_take || "not_packed",
-        to_bring_home: item.to_bring_home || "not_packed"
-      };
-
-      const isHome = list.state === "home";
-      const isAway = list.state === "away";
-
-      // valid transitions
-      const validHome = ["not_packed", "packed", "not_needed", "missing", "broken"];
-      const validAway = [
-        "not_packed",
-        "packed",
-        "missing",
-        "broken",
-        "left_over",
-        "sent_back_early"
-      ];
-
-      if (isHome && !validHome.includes(statusToken)) {
-        return { changed: false, reason: "invalid_status_for_home" };
-      }
-      if (isAway && !validAway.includes(statusToken)) {
-        return { changed: false, reason: "invalid_status_for_away" };
-      }
-
-      if (isHome) {
-        item.to_take = statusToken;
-      } else if (isAway) {
-        item.to_bring_home = statusToken;
-      } else {
-        // default home-like
-        item.to_take = statusToken;
-      }
-
-      // block on missing/broken
-      if (statusToken === "missing" || statusToken === "broken") {
-        item.blocked = true;
-      }
-
-      const after = {
-        to_take: item.to_take,
-        to_bring_home: item.to_bring_home
-      };
-      const changed =
-        before.to_take !== after.to_take ||
-        before.to_bring_home !== after.to_bring_home;
-
-      return { changed, before, after };
-    }
-
-    function buildIndex(started) {
-      const idx = {
-        version: "1.0",
-        updated_at: ts,
-        shows: {}
-      };
-      if (!started.shows) return idx;
-
-      for (const [sid, s] of Object.entries(started.shows)) {
-        const showEntry = {
-          state: s.state || "home",
-          lists: {}
-        };
-        for (const [lname, l] of Object.entries(s.lists || {})) {
-          const items = l.items || [];
-          let total = items.length;
-          let to_take_remaining = 0;
-          let to_bring_home_remaining = 0;
-
-          for (const it of items) {
-            if ((l.state || "home") === "home") {
-              if (!it.to_take || it.to_take === "not_packed") {
-                to_take_remaining++;
-              }
-            } else if ((l.state || "home") === "away") {
-              if (!it.to_bring_home || it.to_bring_home === "not_packed") {
-                to_bring_home_remaining++;
-              }
-            }
-          }
-
-          showEntry.lists[lname] = {
-            state: l.state || "home",
-            total_items: total,
-            to_take_remaining,
-            to_bring_home_remaining
-          };
-        }
-        idx.shows[sid] = showEntry;
-      }
-
-      return idx;
-    }
-
-    function computeHints(list) {
-      const items = list.items || [];
-      let to_take_done = 0;
-      let to_take_total = 0;
-      let to_bring_done = 0;
-      let to_bring_total = 0;
-
-      for (const it of items) {
-        if (list.state === "home") {
-          to_take_total++;
-          if (
-            it.to_take === "packed" ||
-            it.to_take === "not_needed"
-          ) {
-            to_take_done++;
-          }
-        } else if (list.state === "away") {
-          to_bring_total++;
-          if (
-            it.to_bring_home === "packed" ||
-            it.to_bring_home === "missing" ||
-            it.to_bring_home === "broken" ||
-            it.to_bring_home === "left_over" ||
-            it.to_bring_home === "sent_back_early"
-          ) {
-            to_bring_done++;
-          }
-        }
-      }
-
-      const hints = {};
-      if (list.state === "home" && to_take_total > 0 && to_take_done === to_take_total) {
-        hints.ready_to_mark_away = true;
-      }
-      if (list.state === "away" && to_bring_total > 0 && to_bring_done === to_bring_total) {
-        hints.ready_to_mark_complete = true;
-      }
-      return {
-        to_take_total,
-        to_take_done,
-        to_bring_total,
-        to_bring_done,
-        hints
-      };
-    }
-
-    // --- load current data ---
-
-    const [
-      showsData,
-      stateRaw,
-      startedRaw,
-      archivedRaw,
-      itemRegistryRaw,
-      listRegistryRaw,
-      updatesRaw
-    ] = await Promise.all([
-      readJson(`${ROOT}/shows/show_schedule.json`, { shows: [] }),
-      readJson(`${ROOT}/state.json`, {}),
-      readJson(`${ROOT}/lists/started_lists.json`, { version: "1.0", shows: {} }),
-      readJson(`${ROOT}/lists/archived_lists.json`, { version: "1.0", shows: {} }),
-      readJson(`${ROOT}/lists/item_registry.json`, { item_registry: {} }),
-      readJson(`${ROOT}/lists/list_registry.json`, { list_registry: {} }),
-      readJson(`${ROOT}/logs/updates.json`, { events: [] })
-    ]);
-
-    const state = stateRaw || {};
-    const started = startedRaw || { version: "1.0", shows: {} };
-    const archived = archivedRaw || { version: "1.0", shows: {} };
-    const itemRegistry = (itemRegistryRaw && itemRegistryRaw.item_registry) || {};
-    const listRegistry = (listRegistryRaw && listRegistryRaw.list_registry) || {};
-    const updates = updatesRaw || { events: [] };
-    if (!Array.isArray(updates.events)) updates.events = [];
-
-    const cmd = parseCommand(command, listRegistry);
-
-    if (cmd.kind === "unsupported") {
-      return res.status(400).json({ ok: false, error: "unsupported_command" });
-    }
-
-    const activeShow = selectActiveShow(showsData, ts);
-    if (!activeShow) {
-      return res.status(400).json({ ok: false, error: "no_active_or_upcoming_show" });
-    }
-
-    const showEntry = ensureShowContainer(started, activeShow);
-    state.last_command_at = ts;
-    state.last_device_id = device_id;
-    if (actor) state.last_actor = actor;
-    state.active_show_id = activeShow.show_id;
-
-    let targetList = null;
-    let targetItem = null;
-    let statusToken = null;
-    let eventNote = "";
-    let listSummary = null;
-
-    // --- execute command ---
-
-    if (cmd.kind === "add_item") {
-      const listKey = normalizeListName(cmd.raw_list, listRegistry) || cmd.raw_list.toLowerCase();
-      const list = ensureList(showEntry, listKey);
-
-      const { canonical, blocked } = normalizeItemName(cmd.raw_item, itemRegistry);
-      if (blocked) {
-        return res.status(400).json({ ok: false, error: "item_blocked_missing_or_broken" });
-      }
-
-      const existing = findItem(list, canonical);
-      if (!existing) {
-        const it = {
-          uid: uid(),
-          name: canonical,
-          created_at: ts,
-          to_take: "not_packed",
-          to_bring_home: "not_packed",
-          blocked: false
-        };
-        list.items.push(it);
-        targetList = list;
-        targetItem = it;
-        eventNote = "add_item";
-      } else {
-        targetList = list;
-        targetItem = existing.item;
-        eventNote = "add_item_duplicate_ignored";
-      }
-
-      listSummary = computeHints(list);
-    }
-
-    if (cmd.kind === "item_status") {
-      statusToken = pickStatusToken(cmd.raw_status || "");
-      if (!statusToken) {
-        return res.status(400).json({ ok: false, error: "invalid_status" });
-      }
-
-      // search across all lists in active show
-      let foundRef = null;
-      for (const [lname, l] of Object.entries(showEntry.lists || {})) {
-        const m = findItem(l, cmd.raw_item);
-        if (m) {
-          foundRef = { listName: lname, list: l, index: m.index, item: m.item };
-          break;
-        }
-      }
-
-      if (!foundRef) {
-        return res.status(400).json({ ok: false, error: "item_not_found_in_active_show" });
-      }
-
-      const { listName, list, item } = foundRef;
-      const apply = applyItemStatus(list, item, statusToken);
-      if (!apply.changed) {
-        eventNote = apply.reason || "no_change";
-      } else {
-        eventNote = "item_status_update";
-      }
-
-      targetList = list;
-      targetItem = item;
-      listSummary = computeHints(list);
-    }
-
-    if (cmd.kind === "list_state") {
-      const listKey = normalizeListName(cmd.raw_list, listRegistry) || cmd.raw_list.toLowerCase();
-      const list = ensureList(showEntry, listKey);
-
-      if (cmd.list_state === "away") {
-        // caller confirms they are shipping out
-        list.state = "away";
-        eventNote = "list_mark_away_confirmed";
-      } else if (cmd.list_state === "complete") {
-        list.state = "complete";
-        eventNote = "list_mark_complete_confirmed";
-      }
-
-      targetList = list;
-      listSummary = computeHints(list);
-    }
-
-    if (cmd.kind === "show_list") {
-      const listKey = normalizeListName(cmd.raw_list, listRegistry) || cmd.raw_list.toLowerCase();
-      const list = ensureList(showEntry, listKey);
-      targetList = list;
-      listSummary = computeHints(list);
-
-      const compact = (list.items || []).map(it => ({
-        name: it.name,
-        to_take: it.to_take || "not_packed",
-        to_bring_home: it.to_bring_home || "not_packed"
-      }));
-
-      const resp = {
-        ok: true,
-        show_id: activeShow.show_id,
-        show_name: activeShow.show_name,
-        list: list.name,
-        list_state: list.state,
-        counts: {
-          total_items: list.items.length,
-          to_take_total: listSummary.to_take_total,
-          to_take_done: listSummary.to_take_done,
-          to_bring_home_total: listSummary.to_bring_total,
-          to_bring_home_done: listSummary.to_bring_done
-        },
-        hints: listSummary.hints,
-        items: compact
-      };
-      return res.json(resp);
-    }
-
-    if (cmd.kind === "summary") {
-      const index = buildIndex(started);
-      return res.json({
-        ok: true,
-        show_id: activeShow.show_id,
-        show_name: activeShow.show_name,
-        index
-      });
-    }
-
-    // if we reach here, we mutated or attempted to mutate
-
-    const index = buildIndex(started);
-
-    // --- log event ---
-
-    const evt = {
-      id: uid(),
-      ts,
-      device_id,
-      actor: actor || null,
-      command_raw: command,
-      show_id: activeShow.show_id,
-      show_name: activeShow.show_name,
-      list_name: targetList ? targetList.name : null,
-      item_uid: targetItem ? targetItem.uid : null,
-      item_name: targetItem ? targetItem.name : null,
-      status_to_take: targetItem ? targetItem.to_take || null : null,
-      status_to_bring_home: targetItem ? targetItem.to_bring_home || null : null,
-      list_state: targetList ? targetList.state || null : null,
-      note: eventNote
-    };
-    updates.events.push(evt);
-
-    // --- prepare commits ---
-
-    const files = [
-      {
-        path: `items/${ROOT}/state.json`,
-        json: state
-      },
-      {
-        path: `items/${ROOT}/lists/started_lists.json`,
-        json: started
-      },
-      {
-        path: `items/${ROOT}/lists/index.json`,
-        json: index
-      },
-      {
-        path: `items/${ROOT}/logs/updates.json`,
-        json: updates
-      }
-    ];
-
-    // archived.json is untouched in this minimal route; include only if you later move shows.
-
-    await commitBulk("list-runner command", files);
-
-    // --- response summary for mobile / voice ---
-
-    const summaryCounts =
-      targetList && listSummary
-        ? {
-            total_items: targetList.items.length,
-            to_take_total: listSummary.to_take_total,
-            to_take_done: listSummary.to_take_done,
-            to_bring_home_total: listSummary.to_bring_total,
-            to_bring_home_done: listSummary.to_bring_done
-          }
-        : null;
-
-    const speechParts = [];
-    if (targetList && summaryCounts) {
-      if (targetList.state === "home") {
-        speechParts.push(
-          `${summaryCounts.to_take_done} of ${summaryCounts.to_take_total} to-take items are set.`
-        );
-        if (listSummary.hints.ready_to_mark_away) {
-          speechParts.push("This list is ready to mark away.");
-        }
-      } else if (targetList.state === "away") {
-        speechParts.push(
-          `${summaryCounts.to_bring_home_done} of ${summaryCounts.to_bring_home_total} return items are set.`
-        );
-        if (listSummary.hints.ready_to_mark_complete) {
-          speechParts.push("This list is ready to mark complete.");
-        }
-      }
-    }
-
-    const resp = {
-      ok: true,
-      show_id: activeShow.show_id,
-      show_name: activeShow.show_name,
-      list: targetList ? targetList.name : null,
-      list_state: targetList ? targetList.state : null,
-      item: targetItem
-        ? {
-            uid: targetItem.uid,
-            name: targetItem.name,
-            to_take: targetItem.to_take,
-            to_bring_home: targetItem.to_bring_home,
-            blocked: !!targetItem.blocked
-          }
-        : null,
-      counts: summaryCounts,
-      hints: listSummary ? listSummary.hints : {},
-      speech: speechParts.join(" "),
-      debug: debug
-        ? {
-            parsed: cmd,
-            event: evt
-          }
-        : undefined
-    };
-
-    return res.json(resp);
-  } catch (e) {
-    console.error("list-runner/command error:", e);
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
 // --- /items/agents/list-runner/command --- primary List-Runner write surface ---
 app.post("/items/agents/list-runner/command", async (req, res) => {
   try {
-    const { device_id, command, now, debug } = req.body || {};
+    const { device_id, command, actor, now, debug } = req.body || {};
     if (!device_id || !command) {
       return res.status(400).json({ ok: false, error: "device_id and command required" });
     }
@@ -1263,6 +572,7 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
     const ROOT = "agents/list-runner";
 
     // ---------- helpers ----------
+
     async function readJson(rel, fallback) {
       const url = `${baseUrl}/items/${rel}`;
       const r = await fetchWithRetry(url, { method: "GET" });
@@ -1326,7 +636,7 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       return Number.isNaN(t) ? NaN : t;
     }
 
-    // choose active show: inside, pre-pack (1–3d), next upcoming; allow explicit id/name from command
+    // choose active show based on schedule + command + previous state
     function resolveActiveShow(schedule, state, cmd, isoNow) {
       const shows = Array.isArray(schedule?.shows) ? schedule.shows : [];
       if (!shows.length) return null;
@@ -1334,7 +644,7 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       const lower = cmd.toLowerCase();
       const nowMs = toMs(isoNow);
 
-      // explicit: "use show 7129" or "#7129"
+      // explicit: "show 7129" or "#7129"
       let m = lower.match(/show\s+(\d{3,})/);
       if (!m) m = lower.match(/#(\d{3,})/);
       if (m) {
@@ -1346,7 +656,7 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
         if (byId) return byId;
       }
 
-      // explicit by name fragment (rough)
+      // explicit by name fragment
       const nameHit = shows.find(s => {
         if (!s.show_name) return false;
         const base = s.show_name.split("(")[0].trim().toLowerCase();
@@ -1354,7 +664,7 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       });
       if (nameHit) return nameHit;
 
-      // inside a show
+      // inside a show window
       for (const s of shows) {
         const start = toMs(s.start_date);
         const end = toMs(s.end_date);
@@ -1363,7 +673,7 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
         }
       }
 
-      // pre-pack window 1–3 days before
+      // pre-pack 1–3 days before
       let pre = null;
       for (const s of shows) {
         const start = toMs(s.start_date);
@@ -1384,17 +694,16 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       }
       if (next) return next;
 
-      // fallback: prior active_show_id if still exists
+      // fallback: previous active_show_id
       if (state?.active_show_id) {
         const prev = shows.find(s => String(s.show_id) === String(state.active_show_id));
         if (prev) return prev;
       }
 
-      // final fallback
       return shows[0];
     }
 
-    // canonicalize status words
+    // status normalization
     function normalizeStatus(word) {
       const w = (word || "").toLowerCase().replace(/[_-]+/g, " ").trim();
       if (w === "packed") return "packed";
@@ -1408,55 +717,67 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       return null;
     }
 
-    // parse a natural command into action + args
+    // parse mobile-friendly commands
     function parseCommand(cmd) {
       const raw = cmd.trim();
       const lower = raw.toLowerCase();
 
-      // 1) add <item> to <list>
+      // add <item> to <list>
       let m = lower.match(/^add\s+(.+?)\s+to\s+(tack|equipment|feed)\b/);
       if (m) {
         return {
-          action: "add_item",
+          kind: "add_item",
           item_name: raw.slice(m.index + 4, m.index + 4 + m[1].length).trim(),
           list_name: m[2]
         };
       }
 
-      // 2) mark <item> <status> [by X]
+      // mark <item> <status> [by X]
       m = lower.match(/^mark\s+(.+?)\s+(packed|not\s+packed|not\s+needed|missing|broken|left\s*over|leftover|sent\s+back(?:\s+early)?|reset)(?:\s+by\s+(.+))?$/);
       if (m) {
         const itemRaw = raw.slice(m.index + 5, m.index + 5 + m[1].length).trim();
         const statusWord = m[2];
-        const confirmByRaw = m[3] ? raw.substring(raw.toLowerCase().indexOf(m[3])).replace(/^by\s+/i, "").trim() : null;
+        const confirmByRaw = m[3]
+          ? raw.substring(raw.toLowerCase().indexOf(m[3])).replace(/^by\s+/i, "").trim()
+          : null;
         const status = normalizeStatus(statusWord);
-        if (!status) return { action: null };
+        if (!status) return { kind: "unsupported" };
         return {
-          action: status === "reset" ? "reset_item" : "set_status",
+          kind: status === "reset" ? "reset_item" : "set_status",
           item_name: itemRaw,
           status,
           confirm_by: confirmByRaw || null
         };
       }
 
-      // 3) bulk pack to_take
+      // bulk pack to_take
       if (lower.includes("make sure") && lower.includes("packed") && lower.includes("take")) {
-        return { action: "bulk_pack_to_take" };
+        return { kind: "bulk_pack_to_take" };
       }
 
-      // 4) bulk pack to_bring_home
+      // bulk pack to_bring_home
       if (
         lower.includes("make sure") &&
         lower.includes("packed") &&
         (lower.includes("leave") || lower.includes("home"))
       ) {
-        return { action: "bulk_pack_to_bring_home" };
+        return { kind: "bulk_pack_to_bring_home" };
       }
 
-      return { action: null };
+      // show <list> list
+      m = lower.match(/^show\s+(?:me\s+)?(?:my\s+)?(tack|equipment|feed)\s+list$/);
+      if (m) {
+        return { kind: "show_list", list_name: m[1] };
+      }
+
+      // summary
+      if (lower === "summary" || lower === "show summary") {
+        return { kind: "summary" };
+      }
+
+      return { kind: "unsupported" };
     }
 
-    // ensure show node + default lists under started_lists.json
     function ensureShow(started, show) {
       if (!started.shows) started.shows = {};
       const key = String(show.show_id);
@@ -1483,14 +804,17 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       if (!state.items) state.items = {};
     }
 
-    function touchDevice(state, device_id, ip, ts) {
+    function touchDevice(state, device_id, ip, ts, actor) {
       ensureStateScaffold(state);
       if (!state.devices[device_id]) state.devices[device_id] = {};
       state.devices[device_id].last_seen = ts;
       if (ip) state.devices[device_id].last_ip = ip;
+      if (actor) state.devices[device_id].last_actor = actor;
+      state.last_command_at = ts;
+      state.last_device_id = device_id;
+      if (actor) state.last_actor = actor;
     }
 
-    // item registry lookup: uses lists/item_registry.json (array of objects)
     function buildItemRegistryMap(reg) {
       const map = {};
       if (!Array.isArray(reg)) return map;
@@ -1499,14 +823,13 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
         const key = e.name.toLowerCase();
         map[key] = e;
         if (Array.isArray(e.aliases)) {
-          for (const a of e.aliases) {
-            if (a) map[a.toLowerCase()] = e;
-          }
+          for (const a of e.aliases) if (a) map[a.toLowerCase()] = e;
         }
         if (Array.isArray(e.mispells)) {
-          for (const m of e.mispells) {
-            if (m) map[m.toLowerCase()] = e;
-          }
+          for (const m of e.mispells) if (m) map[m.toLowerCase()] = e;
+        }
+        if (Array.isArray(e.nicknames)) {
+          for (const n of e.nicknames) if (n) map[n.toLowerCase()] = e;
         }
       }
       return map;
@@ -1523,7 +846,6 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
           note: hit.note || null
         };
       }
-      // default from list name
       let type = null;
       if (listName === "tack") type = "tack";
       else if (listName === "equipment") type = "equipment";
@@ -1541,8 +863,7 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       ensureStateScaffold(state);
       const k = itemName.toLowerCase();
       if (!state.items[k]) state.items[k] = { name: itemName };
-      if (status === "reset" || status === "packed" || status === "not_packed" || status === "not_needed") {
-        // treat as cleared / ok
+      if (["reset", "packed", "not_packed", "not_needed"].includes(status)) {
         state.items[k].status = "ok";
         state.items[k].where = where || null;
       } else {
@@ -1556,7 +877,6 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       const lname = listName.toLowerCase();
       const list = showState.lists[lname] || (showState.lists[lname] = []);
 
-      // block if globally missing/broken unless reset
       const global = globalItemStatus(state, itemName);
       if (global && (global.status === "missing" || global.status === "broken")) {
         return { added: false, blocked: true, reason: global.status };
@@ -1583,9 +903,7 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
         ]
       });
 
-      // initialize global status as ok/home
       setGlobalItemStatus(state, def.name, "ok", "home", ts);
-
       return { added: true, blocked: false };
     }
 
@@ -1596,9 +914,7 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
         for (let i = 0; i < arr.length; i++) {
           const it = arr[i];
           if ((it.name || "").toLowerCase() === needle) {
-            if (found) {
-              return { error: "ambiguous" };
-            }
+            if (found) return { error: "ambiguous" };
             found = { listName: lname, index: i, item: it };
           }
         }
@@ -1612,7 +928,7 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       const located = findItemOnShow(showState, item_name);
       if (located.error) return { changed: false, error: located.error };
 
-      const { listName, index, item } = located;
+      const { listName, item } = located;
       const showMode = showState.state || "home";
       const key = (showMode === "away" || showMode === "complete")
         ? "to_bring_home"
@@ -1630,14 +946,12 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
           by: confirm_by || device_id
         });
         setGlobalItemStatus(state, item.name, "ok", null, ts);
-        return { changed: true, listName, item };
+        return { changed: prev !== item[key], listName, item };
       }
 
       const canonical = status;
       const prev = item[key] || null;
-      if (prev === canonical) {
-        return { changed: false, listName, item };
-      }
+      if (prev === canonical) return { changed: false, listName, item };
 
       item[key] = canonical;
       if (!item.history) item.history = [];
@@ -1650,15 +964,12 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
         by: confirm_by || device_id
       });
 
-      // update global status on serious outcomes
       if (["missing", "broken", "left_over", "sent_back_early"].includes(canonical)) {
-        const where =
-          canonical === "left_over"
-            ? `show:${showState.show_id || ""}`
-            : null;
+        const where = canonical === "left_over"
+          ? `show:${showState.show_id || ""}`
+          : null;
         setGlobalItemStatus(state, item.name, canonical, where, ts);
       } else if (canonical === "packed" || canonical === "not_needed") {
-        // packed/not_needed tends toward ok; we do not force where
         setGlobalItemStatus(state, item.name, canonical, null, ts);
       }
 
@@ -1719,16 +1030,32 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       }
     }
 
+    function buildShowListView(showState, listName) {
+      const arr = showState.lists[listName] || [];
+      return arr.map(it => ({
+        name: it.name,
+        to_take: it.to_take || "not_packed",
+        to_bring_home: it.to_bring_home || "not_packed"
+      }));
+    }
+
     // ---------- load current state ----------
-    const [stateRaw, schedule, startedRaw, archivedRaw, updatesRaw, itemRegRaw] =
-      await Promise.all([
-        readJson(`${ROOT}/state.json`, {}),
-        readJson(`${ROOT}/shows/show_schedule.json`, { shows: [] }),
-        readJson(`${ROOT}/lists/started_lists.json`, { shows: {} }),
-        readJson(`${ROOT}/lists/archived_lists.json`, { shows: {} }),
-        readJson(`${ROOT}/logs/updates.json`, { events: [] }),
-        readJson(`${ROOT}/lists/item_registry.json`, [])
-      ]);
+
+    const [
+      stateRaw,
+      schedule,
+      startedRaw,
+      archivedRaw,
+      updatesRaw,
+      itemRegRaw
+    ] = await Promise.all([
+      readJson(`${ROOT}/state.json`, {}),
+      readJson(`${ROOT}/shows/show_schedule.json`, { shows: [] }),
+      readJson(`${ROOT}/lists/started_lists.json`, { shows: {} }),
+      readJson(`${ROOT}/lists/archived_lists.json`, { shows: {} }),
+      readJson(`${ROOT}/logs/updates.json`, { events: [] }),
+      readJson(`${ROOT}/lists/item_registry.json`, [])
+    ]);
 
     const state = stateRaw || {};
     const started = startedRaw || { shows: {} };
@@ -1736,61 +1063,82 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
     const updates = updatesRaw || { events: [] };
     if (!Array.isArray(updates.events)) updates.events = [];
 
-    touchDevice(state, device_id, req.ip, ts);
+    touchDevice(state, device_id, req.ip, ts, actor);
 
     const regMap = buildItemRegistryMap(itemRegRaw);
     const activeShow = resolveActiveShow(schedule, state, command, ts);
     if (!activeShow) {
-      return res.status(500).json({ ok: false, error: "no shows in schedule" });
+      return res.status(400).json({ ok: false, error: "no_active_or_upcoming_show" });
     }
 
     const parsed = parseCommand(command);
-    if (!parsed.action) {
-      return res.status(400).json({ ok: false, error: "unsupported command" });
+    if (parsed.kind === "unsupported") {
+      return res.status(400).json({ ok: false, error: "unsupported_command" });
     }
 
     const { key: showKey, showState } = ensureShow(started, activeShow);
 
     // ---------- apply command ----------
-    let actionLabel = parsed.action;
-    let bulkCount = 0;
-    let changed = false;
-    let errorDetail = null;
 
-    if (parsed.action === "add_item") {
+    let actionLabel = parsed.kind;
+    let bulkCount = 0;
+    let errorDetail = null;
+    let listNameForView = null;
+
+    if (parsed.kind === "add_item") {
       const out = addItemToList(showState, parsed.list_name, parsed.item_name, regMap, state, ts);
+      listNameForView = parsed.list_name;
       if (out.blocked) {
         actionLabel = `blocked_${out.reason}`;
         errorDetail = `item locked as ${out.reason}`;
-      } else if (out.added) {
-        changed = true;
-      } else {
-        actionLabel = "noop_item_exists";
       }
-    } else if (parsed.action === "set_status") {
+    }
+
+    if (parsed.kind === "set_status" || parsed.kind === "reset_item") {
       const r = applyStatusToItem(showState, state, parsed, ts);
       if (r.error === "not_found") {
-        return res.status(400).json({ ok: false, error: "item not found" });
+        return res.status(400).json({ ok: false, error: "item_not_found" });
       }
       if (r.error === "ambiguous") {
-        return res.status(400).json({ ok: false, error: "item ambiguous" });
+        return res.status(400).json({ ok: false, error: "item_ambiguous" });
       }
-      changed = r.changed;
-    } else if (parsed.action === "reset_item") {
-      const r = applyStatusToItem(showState, state, parsed, ts);
-      if (r.error === "not_found") {
-        return res.status(400).json({ ok: false, error: "item not found" });
-      }
-      if (r.error === "ambiguous") {
-        return res.status(400).json({ ok: false, error: "item ambiguous" });
-      }
-      changed = r.changed;
-    } else if (parsed.action === "bulk_pack_to_take") {
+      listNameForView = r.listName;
+    }
+
+    if (parsed.kind === "bulk_pack_to_take") {
       bulkCount = bulkPack(showState, state, "to_take", ts);
-      changed = bulkCount > 0;
-    } else if (parsed.action === "bulk_pack_to_bring_home") {
+      actionLabel = "bulk_pack_to_take";
+    }
+
+    if (parsed.kind === "bulk_pack_to_bring_home") {
       bulkCount = bulkPack(showState, state, "to_bring_home", ts);
-      changed = bulkCount > 0;
+      actionLabel = "bulk_pack_to_bring_home";
+    }
+
+    // show list (read-only)
+    if (parsed.kind === "show_list") {
+      const listName = parsed.list_name.toLowerCase();
+      const view = buildShowListView(showState, listName);
+      const counts = summarize(showState);
+      return res.json({
+        ok: true,
+        show_id: activeShow.show_id,
+        show_name: activeShow.show_name,
+        list: listName,
+        counts,
+        items: view
+      });
+    }
+
+    // summary (read-only)
+    if (parsed.kind === "summary") {
+      const counts = summarize(showState);
+      return res.json({
+        ok: true,
+        show_id: activeShow.show_id,
+        show_name: activeShow.show_name,
+        counts
+      });
     }
 
     // update state header
@@ -1798,28 +1146,23 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
     state.active_show_name = activeShow.show_name;
     state.updated_at = ts;
 
-    // auto-archive by age (3+ days after end)
+    // auto archive
     autoArchiveOldShows(started, archived, ts);
 
-    // log event (even if no-op)
-    const files_touched = [
-      `${ROOT}/state.json`,
-      `${ROOT}/lists/started_lists.json`,
-      `${ROOT}/logs/updates.json`
-    ];
+    // log event
     const event = {
       ts,
       device_id,
       ip: req.ip,
+      actor: actor || null,
       show_id: activeShow.show_id,
       show_name: activeShow.show_name,
       show_key: showKey,
       command_raw: command,
       action: actionLabel,
-      bulk_count: bulkCount,
-      error: errorDetail || null,
-      files_touched,
-      success: errorDetail ? false : true
+      bulk_count: bulkCount || 0,
+      error: errorDetail,
+      success: !errorDetail
     };
     updates.events.push(event);
 
@@ -1838,11 +1181,11 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
 
     await commitFiles("list-runner command", files);
 
-    // run expeditor to refresh lists/index.json etc.
+    // run expeditor (updates lists/index.json etc.)
     try {
       await runExpeditor();
     } catch (e) {
-      return res.status(500).json({ ok: false, error: `expeditor failed: ${e.message}` });
+      return res.status(500).json({ ok: false, error: `expeditor_failed: ${e.message}` });
     }
 
     const counts = summarize(showState);
@@ -1855,9 +1198,7 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       counts
     };
     if (errorDetail) resp.error = errorDetail;
-    if (debug) {
-      resp.debug = { parsed, event };
-    }
+    if (debug) resp.debug = { parsed, event };
 
     return res.json(resp);
   } catch (e) {
