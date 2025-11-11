@@ -560,16 +560,20 @@ app.post("/items/commit-bulk", async (req, res) => {
   }
 });
 // --- /items/agents/list-runner/command --- primary List-Runner write surface ---
+// --- /items/agents/list-runner/command --- primary List-Runner write surface (new) ---
 app.post("/items/agents/list-runner/command", async (req, res) => {
   try {
-    const { device_id, command, actor, now, debug } = req.body || {};
-    if (!device_id || !command) {
-      return res.status(400).json({ ok: false, error: "device_id and command required" });
+    const { device_id, command, actor, now, intent } = req.body || {};
+    if (!device_id || (!command && !intent)) {
+      return res.status(400).json({ ok: false, error: "device_id and command or intent required" });
     }
 
     const ts = typeof now === "string" ? now : new Date().toISOString();
     const baseUrl = `${req.protocol}://${req.get("host")}`;
     const ROOT = "agents/list-runner";
+    const LIB = `${ROOT}/lib`;
+    const LISTS = `${ROOT}/lists`;
+    const LOGS = `${ROOT}/logs`;
 
     // ---------- helpers ----------
 
@@ -630,582 +634,611 @@ app.post("/items/agents/list-runner/command", async (req, res) => {
       });
     }
 
-    function toMs(iso) {
-      if (!iso) return NaN;
-      const t = Date.parse(iso);
-      return Number.isNaN(t) ? NaN : t;
+    function ensureListsShape(started, archived) {
+      const s = started && typeof started === "object" ? started : {};
+      const a = archived && typeof archived === "object" ? archived : {};
+      if (!Array.isArray(s.lists)) s.lists = [];
+      if (!Array.isArray(a.lists)) a.lists = [];
+      return { started: s, archived: a };
     }
 
-    // choose active show based on schedule + command + previous state
-    function resolveActiveShow(schedule, state, cmd, isoNow) {
-      const shows = Array.isArray(schedule?.shows) ? schedule.shows : [];
-      if (!shows.length) return null;
-
-      const lower = cmd.toLowerCase();
-      const nowMs = toMs(isoNow);
-
-      // explicit: "show 7129" or "#7129"
-      let m = lower.match(/show\s+(\d{3,})/);
-      if (!m) m = lower.match(/#(\d{3,})/);
-      if (m) {
-        const id = m[1];
-        const byId = shows.find(s =>
-          String(s.show_id) === id ||
-          (s.show_name && s.show_name.includes(`#${id}`))
-        );
-        if (byId) return byId;
-      }
-
-      // explicit by name fragment
-      const nameHit = shows.find(s => {
-        if (!s.show_name) return false;
-        const base = s.show_name.split("(")[0].trim().toLowerCase();
-        return base && lower.includes(base);
-      });
-      if (nameHit) return nameHit;
-
-      // inside a show window
-      for (const s of shows) {
-        const start = toMs(s.start_date);
-        const end = toMs(s.end_date);
-        if (!Number.isNaN(start) && !Number.isNaN(end) && nowMs >= start && nowMs <= end) {
-          return s;
-        }
-      }
-
-      // pre-pack 1–3 days before
-      let pre = null;
-      for (const s of shows) {
-        const start = toMs(s.start_date);
-        if (Number.isNaN(start) || start <= nowMs) continue;
-        const diffDays = (start - nowMs) / 86400000;
-        if (diffDays >= 1 && diffDays <= 3) {
-          if (!pre || start < toMs(pre.start_date)) pre = s;
-        }
-      }
-      if (pre) return pre;
-
-      // next upcoming
-      let next = null;
-      for (const s of shows) {
-        const start = toMs(s.start_date);
-        if (Number.isNaN(start) || start < nowMs) continue;
-        if (!next || start < toMs(next.start_date)) next = s;
-      }
-      if (next) return next;
-
-      // fallback: previous active_show_id
-      if (state?.active_show_id) {
-        const prev = shows.find(s => String(s.show_id) === String(state.active_show_id));
-        if (prev) return prev;
-      }
-
-      return shows[0];
+    function ensureLogsShape(updates, txns) {
+      const u = updates && typeof updates === "object" ? updates : {};
+      const t = txns && typeof txns === "object" ? txns : {};
+      if (!Array.isArray(u.events)) u.events = [];
+      if (!Array.isArray(t.transactions)) t.transactions = [];
+      return { updates: u, txns: t };
     }
 
-    // status normalization
     function normalizeStatus(word) {
-      const w = (word || "").toLowerCase().replace(/[_-]+/g, " ").trim();
+      const w = String(word || "").toLowerCase().replace(/[_-]+/g, " ").trim();
       if (w === "packed") return "packed";
       if (w === "not packed" || w === "unpacked") return "not_packed";
       if (w === "not needed" || w === "noneeded" || w === "no need") return "not_needed";
       if (w === "missing") return "missing";
       if (w === "broken") return "broken";
       if (w === "left over" || w === "leftover" || w === "left over there") return "left_over";
-      if (w === "sent back early" || w === "sent back" || w === "sent early") return "sent_back_early";
+      if (w.startsWith("sent back")) return "sent_back_early";
       if (w === "reset") return "reset";
       return null;
     }
 
-    // parse mobile-friendly commands
-    function parseCommand(cmd) {
+    function selectList(started, target) {
+      const lists = started.lists || [];
+      if (!lists.length) return null;
+
+      if (target && target.list_id) {
+        const hit = lists.find(l => l.list_id === target.list_id);
+        if (hit) return hit;
+      }
+
+      if (target && target.show_id) {
+        const byShow = lists.filter(l => l.show_id === target.show_id && l.status !== "archived");
+        if (byShow.length) return byShow[0];
+      }
+
+      const open = lists.filter(l => l.status !== "archived");
+      if (open.length) return open[0];
+
+      return lists[0];
+    }
+
+    function findLine(list, ref) {
+      if (!list || !Array.isArray(list.lines)) return null;
+      if (!ref) return null;
+      const needle = String(ref).toLowerCase();
+
+      const byId = list.lines.find(line => line.line_id === ref);
+      if (byId) return byId;
+
+      return (
+        list.lines.find(
+          line => String(line.label || "").toLowerCase() === needle
+        ) || null
+      );
+    }
+
+    function addLine(list, payload, libs, ts, device_id, actor) {
+      if (!Array.isArray(list.lines)) list.lines = [];
+
+      const line_id =
+        payload.line_id ||
+        `ln_${Date.now().toString(36)}_${Math.random()
+          .toString(36)
+          .slice(2, 6)}`;
+      const label = payload.label || payload.item_label || payload.name;
+      if (!label) return { error: "missing_label" };
+
+      let item_id = payload.item_id || null;
+      let type = payload.type || "inventory";
+
+      if (!item_id && libs && Array.isArray(libs.items)) {
+        const n = label.toLowerCase();
+        const hit = libs.items.find(e => {
+          if (!e || !e.name) return false;
+          if (String(e.name).toLowerCase() === n) return true;
+          if (Array.isArray(e.aliases) && e.aliases.some(a => String(a).toLowerCase() === n)) return true;
+          if (Array.isArray(e.misspells) && e.misspells.some(a => String(a).toLowerCase() === n)) return true;
+          if (Array.isArray(e.nicknames) && e.nicknames.some(a => String(a).toLowerCase() === n)) return true;
+          return false;
+        });
+        if (hit && hit.item_id) {
+          item_id = hit.item_id;
+          type = "inventory";
+        }
+      }
+
+      if (!payload.inventory && type !== "inventory") {
+        type = payload.type || "misc";
+      }
+
+      const qty =
+        typeof payload.qty === "number" && payload.qty > 0
+          ? payload.qty
+          : 1;
+
+      const line = {
+        line_id,
+        label,
+        item_id: item_id || null,
+        type,
+        qty,
+        to_take: "not_packed",
+        to_bring_home: "not_packed",
+        notes: payload.notes || "",
+        created_at: ts,
+        created_by: actor || device_id
+      };
+
+      list.lines.push(line);
+      return { line };
+    }
+
+    function setLineStatus(list, line, status, scope, ts, actor, device_id) {
+      const normalized = normalizeStatus(status);
+      if (!normalized) return { error: "invalid_status" };
+
+      if (scope !== "to_take" && scope !== "to_bring_home") {
+        scope = "to_take";
+      }
+
+      if (!line.history) line.history = [];
+      const prev = line[scope] || "not_packed";
+
+      line[scope] = normalized === "reset" ? "not_packed" : normalized;
+
+      line.history.push({
+        ts,
+        by: actor || device_id,
+        action: "set_status",
+        scope,
+        from: prev,
+        to: line[scope]
+      });
+
+      return { prev, next: line[scope], scope };
+    }
+
+    function addComment(list, text, ts, actor, device_id) {
+      if (!Array.isArray(list.lines)) list.lines = [];
+      const line = {
+        line_id: `note_${Date.now().toString(36)}_${Math.random()
+          .toString(36)
+          .slice(2, 6)}`,
+        label: text,
+        type: "note",
+        qty: 0,
+        to_take: "not_packed",
+        to_bring_home: "not_packed",
+        notes: "",
+        created_at: ts,
+        created_by: actor || device_id
+      };
+      list.lines.push(line);
+      return { line };
+    }
+
+    function applyKit(list, kitIdOrName, libs, ts, device_id, actor) {
+      if (!libs || !Array.isArray(libs.kits)) {
+        return { error: "no_kits_lib" };
+      }
+      const key = String(kitIdOrName || "").toLowerCase();
+      const kit = libs.kits.find(k => {
+        if (!k) return false;
+        if (k.kit_id && String(k.kit_id).toLowerCase() === key) return true;
+        if (k.name && String(k.name).toLowerCase() === key) return true;
+        return false;
+      });
+      if (!kit || !Array.isArray(kit.items) || !kit.items.length) {
+        return { error: "kit_not_found" };
+      }
+
+      const added = [];
+      for (const ki of kit.items) {
+        const payload = {
+          label: ki.label || ki.name,
+          item_id: ki.item_id,
+          qty: ki.qty || 1,
+          type: "inventory"
+        };
+        const res = addLine(list, payload, libs, ts, device_id, actor);
+        if (res.line) added.push(res.line);
+      }
+      return { added, kit };
+    }
+
+    function summarizeList(list) {
+      if (!list || !Array.isArray(list.lines)) {
+        return {
+          total: 0,
+          to_take_remaining: 0,
+          to_bring_home_remaining: 0
+        };
+      }
+      let total = 0;
+      let to_take_remaining = 0;
+      let to_bring_home_remaining = 0;
+      for (const line of list.lines) {
+        if (line.type === "note") continue;
+        total += 1;
+        if (line.to_take === "not_packed") to_take_remaining += 1;
+        if (line.to_bring_home === "not_packed")
+          to_bring_home_remaining += 1;
+      }
+      return { total, to_take_remaining, to_bring_home_remaining };
+    }
+
+    function recordTx(txns, entry) {
+      const tx = {
+        tx_id: `tx_${Date.now().toString(36)}_${Math.random()
+          .toString(36)
+          .slice(2, 8)}`,
+        ...entry
+      };
+      txns.transactions.push(tx);
+      return tx;
+    }
+
+    function appendUpdate(updates, entry) {
+      updates.events.push({
+        ts: entry.ts,
+        device_id: entry.device_id,
+        actor: entry.actor || null,
+        type: entry.type,
+        message: entry.message || "",
+        meta: entry.meta || {}
+      });
+    }
+
+    function parseCommandString(cmd) {
+      if (!cmd || typeof cmd !== "string") return null;
       const raw = cmd.trim();
       const lower = raw.toLowerCase();
 
-      // add <item> to <list>
-      let m = lower.match(/^add\s+(.+?)\s+to\s+(tack|equipment|feed)\b/);
-      if (m) {
-        return {
-          kind: "add_item",
-          item_name: raw.slice(m.index + 4, m.index + 4 + m[1].length).trim(),
-          list_name: m[2]
-        };
-      }
-
-      // mark <item> <status> [by X]
-      m = lower.match(/^mark\s+(.+?)\s+(packed|not\s+packed|not\s+needed|missing|broken|left\s*over|leftover|sent\s+back(?:\s+early)?|reset)(?:\s+by\s+(.+))?$/);
-      if (m) {
-        const itemRaw = raw.slice(m.index + 5, m.index + 5 + m[1].length).trim();
-        const statusWord = m[2];
-        const confirmByRaw = m[3]
-          ? raw.substring(raw.toLowerCase().indexOf(m[3])).replace(/^by\s+/i, "").trim()
-          : null;
-        const status = normalizeStatus(statusWord);
-        if (!status) return { kind: "unsupported" };
-        return {
-          kind: status === "reset" ? "reset_item" : "set_status",
-          item_name: itemRaw,
-          status,
-          confirm_by: confirmByRaw || null
-        };
-      }
-
-      // bulk pack to_take
-      if (lower.includes("make sure") && lower.includes("packed") && lower.includes("take")) {
-        return { kind: "bulk_pack_to_take" };
-      }
-
-      // bulk pack to_bring_home
-      if (
-        lower.includes("make sure") &&
-        lower.includes("packed") &&
-        (lower.includes("leave") || lower.includes("home"))
-      ) {
-        return { kind: "bulk_pack_to_bring_home" };
-      }
-
-      // show <list> list
-      m = lower.match(/^show\s+(?:me\s+)?(?:my\s+)?(tack|equipment|feed)\s+list$/);
-      if (m) {
-        return { kind: "show_list", list_name: m[1] };
-      }
-
-      // summary
       if (lower === "summary" || lower === "show summary") {
-        return { kind: "summary" };
+        return { type: "summary" };
       }
 
-      return { kind: "unsupported" };
-    }
-
-    function ensureShow(started, show) {
-      if (!started.shows) started.shows = {};
-      const key = String(show.show_id);
-      if (!started.shows[key]) {
-        started.shows[key] = {
-          show_id: show.show_id,
-          show_name: show.show_name,
-          start_date: show.start_date,
-          end_date: show.end_date,
-          state: "home",
-          lists: {}
-        };
-      }
-      const s = started.shows[key];
-      if (!s.lists) s.lists = {};
-      for (const name of ["tack", "equipment", "feed"]) {
-        if (!s.lists[name]) s.lists[name] = [];
-      }
-      return { key, showState: s };
-    }
-
-    function ensureStateScaffold(state) {
-      if (!state.devices) state.devices = {};
-      if (!state.items) state.items = {};
-    }
-
-    function touchDevice(state, device_id, ip, ts, actor) {
-      ensureStateScaffold(state);
-      if (!state.devices[device_id]) state.devices[device_id] = {};
-      state.devices[device_id].last_seen = ts;
-      if (ip) state.devices[device_id].last_ip = ip;
-      if (actor) state.devices[device_id].last_actor = actor;
-      state.last_command_at = ts;
-      state.last_device_id = device_id;
-      if (actor) state.last_actor = actor;
-    }
-
-    function buildItemRegistryMap(reg) {
-      const map = {};
-      if (!Array.isArray(reg)) return map;
-      for (const e of reg) {
-        if (!e || !e.name) continue;
-        const key = e.name.toLowerCase();
-        map[key] = e;
-        if (Array.isArray(e.aliases)) {
-          for (const a of e.aliases) if (a) map[a.toLowerCase()] = e;
-        }
-        if (Array.isArray(e.mispells)) {
-          for (const m of e.mispells) if (m) map[m.toLowerCase()] = e;
-        }
-        if (Array.isArray(e.nicknames)) {
-          for (const n of e.nicknames) if (n) map[n.toLowerCase()] = e;
-        }
-      }
-      return map;
-    }
-
-    function resolveItemDefinition(name, listName, regMap) {
-      const n = name.toLowerCase();
-      const hit = regMap[n];
-      if (hit) {
+      let m = lower.match(/^add\s+(.+?)\s+to\s+list\s+(\S+)/);
+      if (m) {
         return {
-          name: hit.name || name,
-          type: hit.type || listName || null,
-          subtype: hit.subtype || null,
-          note: hit.note || null
+          type: "add_line",
+          list_id: m[2],
+          label: raw.slice(m.index + 4, m.index + 4 + m[1].length).trim()
         };
       }
-      let type = null;
-      if (listName === "tack") type = "tack";
-      else if (listName === "equipment") type = "equipment";
-      else if (listName === "feed") type = "feed";
-      return { name, type, subtype: null, note: null };
-    }
 
-    function globalItemStatus(state, itemName) {
-      ensureStateScaffold(state);
-      const k = itemName.toLowerCase();
-      return state.items[k] || null;
-    }
-
-    function setGlobalItemStatus(state, itemName, status, where, ts) {
-      ensureStateScaffold(state);
-      const k = itemName.toLowerCase();
-      if (!state.items[k]) state.items[k] = { name: itemName };
-      if (["reset", "packed", "not_packed", "not_needed"].includes(status)) {
-        state.items[k].status = "ok";
-        state.items[k].where = where || null;
-      } else {
-        state.items[k].status = status;
-        state.items[k].where = where || null;
-      }
-      state.items[k].updated_at = ts;
-    }
-
-    function addItemToList(showState, listName, itemName, regMap, state, ts) {
-      const lname = listName.toLowerCase();
-      const list = showState.lists[lname] || (showState.lists[lname] = []);
-
-      const global = globalItemStatus(state, itemName);
-      if (global && (global.status === "missing" || global.status === "broken")) {
-        return { added: false, blocked: true, reason: global.status };
-      }
-
-      const exists = list.some(
-        it => (it.name || "").toLowerCase() === itemName.toLowerCase()
+      m = lower.match(
+        /^mark\s+(.+?)\s+(packed|not\s+packed|not\s+needed|missing|broken|left\s*over|leftover|sent\s+back(?:\s+early)?|reset)$/
       );
-      if (exists) return { added: false, blocked: false };
-
-      const def = resolveItemDefinition(itemName, lname, regMap);
-      const id = `itm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-      list.push({
-        id,
-        name: def.name,
-        type: def.type,
-        subtype: def.subtype,
-        note: def.note,
-        created_at: ts,
-        to_take: "not_packed",
-        to_bring_home: null,
-        history: [
-          { ts, action: "create", by: device_id }
-        ]
-      });
-
-      setGlobalItemStatus(state, def.name, "ok", "home", ts);
-      return { added: true, blocked: false };
-    }
-
-    function findItemOnShow(showState, itemName) {
-      const needle = itemName.toLowerCase();
-      let found = null;
-      for (const [lname, arr] of Object.entries(showState.lists || {})) {
-        for (let i = 0; i < arr.length; i++) {
-          const it = arr[i];
-          if ((it.name || "").toLowerCase() === needle) {
-            if (found) return { error: "ambiguous" };
-            found = { listName: lname, index: i, item: it };
-          }
-        }
-      }
-      if (!found) return { error: "not_found" };
-      return found;
-    }
-
-    function applyStatusToItem(showState, state, parsed, ts) {
-      const { item_name, status, confirm_by } = parsed;
-      const located = findItemOnShow(showState, item_name);
-      if (located.error) return { changed: false, error: located.error };
-
-      const { listName, item } = located;
-      const showMode = showState.state || "home";
-      const key = (showMode === "away" || showMode === "complete")
-        ? "to_bring_home"
-        : "to_take";
-
-      if (status === "reset") {
-        const prev = item[key];
-        item[key] = "not_packed";
-        if (!item.history) item.history = [];
-        item.history.push({
-          ts,
-          action: "reset",
-          from: prev || null,
-          to: item[key],
-          by: confirm_by || device_id
-        });
-        setGlobalItemStatus(state, item.name, "ok", null, ts);
-        return { changed: prev !== item[key], listName, item };
+      if (m) {
+        return {
+          type: "set_status",
+          line_ref: m[1].trim(),
+          status: m[2]
+        };
       }
 
-      const canonical = status;
-      const prev = item[key] || null;
-      if (prev === canonical) return { changed: false, listName, item };
-
-      item[key] = canonical;
-      if (!item.history) item.history = [];
-      item.history.push({
-        ts,
-        action: "set_status",
-        field: key,
-        from: prev,
-        to: canonical,
-        by: confirm_by || device_id
-      });
-
-      if (["missing", "broken", "left_over", "sent_back_early"].includes(canonical)) {
-        const where = canonical === "left_over"
-          ? `show:${showState.show_id || ""}`
-          : null;
-        setGlobalItemStatus(state, item.name, canonical, where, ts);
-      } else if (canonical === "packed" || canonical === "not_needed") {
-        setGlobalItemStatus(state, item.name, canonical, null, ts);
+      m = lower.match(/^note\s+(.+)/);
+      if (m) {
+        return {
+          type: "add_comment",
+          text: raw.slice(m.index + 5).trim()
+        };
       }
 
-      return { changed: true, listName, item };
+      return null;
     }
 
-    function bulkPack(showState, state, mode, ts) {
-      let count = 0;
-      const key = mode === "to_bring_home" ? "to_bring_home" : "to_take";
-      for (const arr of Object.values(showState.lists || {})) {
-        for (const it of arr) {
-          if (it[key] === "not_packed") {
-            const prev = it[key];
-            it[key] = "packed";
-            if (!it.history) it.history = [];
-            it.history.push({
-              ts,
-              action: "bulk_pack",
-              field: key,
-              from: prev,
-              to: "packed",
-              by: device_id
-            });
-            setGlobalItemStatus(state, it.name, "packed", null, ts);
-            count++;
-          }
-        }
-      }
-      return count;
+    function parseIntent(body) {
+      if (body.intent && body.intent.type) return body.intent;
+      const fromCmd = parseCommandString(body.command);
+      if (fromCmd) return fromCmd;
+      return null;
     }
 
-    function summarize(showState) {
-      let total = 0;
-      let to_take_unpacked = 0;
-      let to_bring_home_unpacked = 0;
-      for (const arr of Object.values(showState.lists || {})) {
-        for (const it of arr) {
-          total++;
-          if (it.to_take === "not_packed") to_take_unpacked++;
-          if (it.to_bring_home === "not_packed") to_bring_home_unpacked++;
-        }
-      }
-      return { total_items: total, to_take_unpacked, to_bring_home_unpacked };
-    }
-
-    function autoArchiveOldShows(started, archived, ts) {
-      const nowMs = toMs(ts);
-      if (!started.shows) return;
-      if (!archived.shows) archived.shows = {};
-      for (const [key, s] of Object.entries(started.shows)) {
-        const end = toMs(s.end_date);
-        if (Number.isNaN(end)) continue;
-        const diffDays = (nowMs - end) / 86400000;
-        if (diffDays >= 3) {
-          archived.shows[key] = s;
-          delete started.shows[key];
-        }
-      }
-    }
-
-    function buildShowListView(showState, listName) {
-      const arr = showState.lists[listName] || [];
-      return arr.map(it => ({
-        name: it.name,
-        to_take: it.to_take || "not_packed",
-        to_bring_home: it.to_bring_home || "not_packed"
-      }));
-    }
-
-    // ---------- load current state ----------
+    // ---------- load current data ----------
 
     const [
-      stateRaw,
-      schedule,
+      showsLib,
+      horsesLib,
+      itemsLib,
+      listsLib,
+      locationsLib,
+      kitsLib,
       startedRaw,
       archivedRaw,
       updatesRaw,
-      itemRegRaw
+      txnsRaw
     ] = await Promise.all([
-      readJson(`${ROOT}/state.json`, {}),
-      readJson(`${ROOT}/shows/show_schedule.json`, { shows: [] }),
-      readJson(`${ROOT}/lists/started_lists.json`, { shows: {} }),
-      readJson(`${ROOT}/lists/archived_lists.json`, { shows: {} }),
-      readJson(`${ROOT}/logs/updates.json`, { events: [] }),
-      readJson(`${ROOT}/lists/item_registry.json`, [])
+      readJson(`${LIB}/shows_lib.json`, []),
+      readJson(`${LIB}/horses_lib.json`, []),
+      readJson(`${LIB}/items_lib.json`, []),
+      readJson(`${LIB}/lists_lib.json`, []),
+      readJson(`${LIB}/locations_lib.json`, []),
+      readJson(`${LIB}/kits_lib.json`, []),
+      readJson(`${LISTS}/started_lists.json`, { lists: [] }),
+      readJson(`${LISTS}/archived_lists.json`, { lists: [] }),
+      readJson(`${LOGS}/updates.json`, { events: [] }),
+      readJson(`${LOGS}/transactions.json`, { transactions: [] })
     ]);
 
-    const state = stateRaw || {};
-    const started = startedRaw || { shows: {} };
-    const archived = archivedRaw || { shows: {} };
-    const updates = updatesRaw || { events: [] };
-    if (!Array.isArray(updates.events)) updates.events = [];
+    const libs = {
+      shows: Array.isArray(showsLib) ? showsLib : showsLib.shows || [],
+      horses: Array.isArray(horsesLib) ? horsesLib : horsesLib.horses || [],
+      items: Array.isArray(itemsLib) ? itemsLib : itemsLib.items || [],
+      lists: Array.isArray(listsLib) ? listsLib : listsLib.lists || [],
+      locations: Array.isArray(locationsLib)
+        ? locationsLib
+        : locationsLib.locations || [],
+      kits: Array.isArray(kitsLib) ? kitsLib : kitsLib.kits || []
+    };
 
-    touchDevice(state, device_id, req.ip, ts, actor);
+    let { started, archived } = ensureListsShape(startedRaw, archivedRaw);
+    let { updates, txns } = ensureLogsShape(updatesRaw, txnsRaw);
 
-    const regMap = buildItemRegistryMap(itemRegRaw);
-    const activeShow = resolveActiveShow(schedule, state, command, ts);
-    if (!activeShow) {
-      return res.status(400).json({ ok: false, error: "no_active_or_upcoming_show" });
+    const parsed = parseIntent({ intent, command });
+    if (!parsed || !parsed.type) {
+      return res
+        .status(400)
+        .json({ ok: false, error: "unsupported_or_unparsed_command" });
     }
 
-    const parsed = parseCommand(command);
-    if (parsed.kind === "unsupported") {
-      return res.status(400).json({ ok: false, error: "unsupported_command" });
-    }
-
-    const { key: showKey, showState } = ensureShow(started, activeShow);
-
-    // ---------- apply command ----------
-
-    let actionLabel = parsed.kind;
-    let bulkCount = 0;
-    let errorDetail = null;
-    let listNameForView = null;
-
-    if (parsed.kind === "add_item") {
-      const out = addItemToList(showState, parsed.list_name, parsed.item_name, regMap, state, ts);
-      listNameForView = parsed.list_name;
-      if (out.blocked) {
-        actionLabel = `blocked_${out.reason}`;
-        errorDetail = `item locked as ${out.reason}`;
+    const target = {
+      list_id: parsed.list_id,
+      show_id: parsed.show_id
+    };
+    let list = null;
+    if (
+      [
+        "add_line",
+        "set_status",
+        "add_comment",
+        "apply_kit",
+        "summary",
+        "show_list"
+      ].includes(parsed.type)
+    ) {
+      list = selectList(started, target);
+      if (!list) {
+        return res.status(400).json({ ok: false, error: "no_target_list" });
       }
     }
 
-    if (parsed.kind === "set_status" || parsed.kind === "reset_item") {
-      const r = applyStatusToItem(showState, state, parsed, ts);
-      if (r.error === "not_found") {
-        return res.status(400).json({ ok: false, error: "item_not_found" });
+    let action = parsed.type;
+    let speech = "";
+    let affectedLine = null;
+
+    // ---------- handle intents ----------
+
+    if (parsed.type === "add_line") {
+      const payload = {
+        line_id: parsed.line_id,
+        label: parsed.label || parsed.item_label,
+        qty: parsed.qty,
+        type: parsed.line_type || parsed.type_hint,
+        item_id: parsed.item_id,
+        notes: parsed.notes
+      };
+      const result = addLine(list, payload, libs, ts, device_id, actor);
+      if (result.error) {
+        return res.status(400).json({ ok: false, error: result.error });
       }
-      if (r.error === "ambiguous") {
-        return res.status(400).json({ ok: false, error: "item_ambiguous" });
+      affectedLine = result.line;
+      recordTx(txns, {
+        ts,
+        device_id,
+        actor,
+        type: "line_add",
+        list_id: list.list_id,
+        line_id: affectedLine.line_id,
+        meta: { label: affectedLine.label, qty: affectedLine.qty }
+      });
+      speech = `Added ${affectedLine.label}.`;
+    }
+
+    if (parsed.type === "set_status") {
+      const line = findLine(
+        list,
+        parsed.line_ref || parsed.line_id || parsed.item_label
+      );
+      if (!line) {
+        return res
+          .status(404)
+          .json({ ok: false, error: "line_not_found" });
       }
-      listNameForView = r.listName;
+      const r = setLineStatus(
+        list,
+        line,
+        parsed.status,
+        parsed.scope,
+        ts,
+        actor,
+        device_id
+      );
+      if (r.error) {
+        return res.status(400).json({ ok: false, error: r.error });
+      }
+      affectedLine = line;
+      recordTx(txns, {
+        ts,
+        device_id,
+        actor,
+        type: "line_status",
+        list_id: list.list_id,
+        line_id: line.line_id,
+        from: r.prev,
+        to: r.next,
+        meta: { scope: r.scope, label: line.label }
+      });
+      speech = `${line.label} marked ${r.next}.`;
     }
 
-    if (parsed.kind === "bulk_pack_to_take") {
-      bulkCount = bulkPack(showState, state, "to_take", ts);
-      actionLabel = "bulk_pack_to_take";
+    if (parsed.type === "add_comment") {
+      const text = parsed.text || parsed.comment;
+      if (!text) {
+        return res
+          .status(400)
+          .json({ ok: false, error: "missing_comment_text" });
+      }
+      const r = addComment(list, text, ts, actor, device_id);
+      affectedLine = r.line;
+      recordTx(txns, {
+        ts,
+        device_id,
+        actor,
+        type: "comment_add",
+        list_id: list.list_id,
+        line_id: r.line.line_id,
+        meta: { text }
+      });
+      speech = "Comment added.";
     }
 
-    if (parsed.kind === "bulk_pack_to_bring_home") {
-      bulkCount = bulkPack(showState, state, "to_bring_home", ts);
-      actionLabel = "bulk_pack_to_bring_home";
+    if (parsed.type === "apply_kit") {
+      const kitKey = parsed.kit_id || parsed.kit_name;
+      const r = applyKit(list, kitKey, libs, ts, device_id, actor);
+      if (r.error) {
+        return res.status(400).json({ ok: false, error: r.error });
+      }
+      recordTx(txns, {
+        ts,
+        device_id,
+        actor,
+        type: "kit_apply",
+        list_id: list.list_id,
+        meta: {
+          kit_id: r.kit.kit_id || null,
+          kit_name: r.kit.name || null,
+          added_count: r.added.length
+        }
+      });
+      speech = `Applied kit ${r.kit.name || r.kit.kit_id}, ${
+        r.added.length
+      } lines added.`;
     }
 
-    // show list (read-only)
-    if (parsed.kind === "show_list") {
-      const listName = parsed.list_name.toLowerCase();
-      const view = buildShowListView(showState, listName);
-      const counts = summarize(showState);
+    if (parsed.type === "summary") {
+      const counts = summarizeList(list);
       return res.json({
         ok: true,
-        show_id: activeShow.show_id,
-        show_name: activeShow.show_name,
-        list: listName,
+        action: "summary",
+        list_id: list.list_id,
+        list_name: list.name,
         counts,
-        items: view
+        speech: `${counts.to_take_remaining} items left to pack.`
       });
     }
 
-    // summary (read-only)
-    if (parsed.kind === "summary") {
-      const counts = summarize(showState);
+    if (parsed.type === "show_list") {
+      const counts = summarizeList(list);
       return res.json({
         ok: true,
-        show_id: activeShow.show_id,
-        show_name: activeShow.show_name,
-        counts
+        action: "show_list",
+        list_id: list.list_id,
+        list_name: list.name,
+        counts,
+        lines: list.lines || []
       });
     }
 
-    // update state header
-    state.active_show_id = activeShow.show_id;
-    state.active_show_name = activeShow.show_name;
-    state.updated_at = ts;
+    // ---------- log + commit ----------
 
-    // auto archive
-    autoArchiveOldShows(started, archived, ts);
-
-    // log event
-    const event = {
+    appendUpdate(updates, {
       ts,
       device_id,
-      ip: req.ip,
-      actor: actor || null,
-      show_id: activeShow.show_id,
-      show_name: activeShow.show_name,
-      show_key: showKey,
-      command_raw: command,
-      action: actionLabel,
-      bulk_count: bulkCount || 0,
-      error: errorDetail,
-      success: !errorDetail
-    };
-    updates.events.push(event);
+      actor,
+      type: action,
+      message: command || action,
+      meta: {
+        list_id: list && list.list_id,
+        line_id: affectedLine && affectedLine.line_id
+      }
+    });
 
-    // prepare commits
+    const counts = summarizeList(list);
+
     const files = [
-      { path: `items/${ROOT}/state.json`, json: state },
-      { path: `items/${ROOT}/lists/started_lists.json`, json: started },
-      { path: `items/${ROOT}/logs/updates.json`, json: updates }
+      { path: `${LISTS}/started_lists.json`, json: started },
+      { path: `${LISTS}/archived_lists.json`, json: archived },
+      { path: `${LOGS}/updates.json`, json: updates },
+      { path: `${LOGS}/transactions.json`, json: txns }
     ];
-    if (archived && Object.keys(archived.shows || {}).length) {
-      files.push({
-        path: `items/${ROOT}/lists/archived_lists.json`,
-        json: archived
-      });
-    }
 
     await commitFiles("list-runner command", files);
 
-    // run expeditor (updates lists/index.json etc.)
     try {
       await runExpeditor();
     } catch (e) {
-      return res.status(500).json({ ok: false, error: `expeditor_failed: ${e.message}` });
+      return res.status(500).json({
+        ok: false,
+        error: `expeditor_failed: ${e.message}`
+      });
     }
 
-    const counts = summarize(showState);
-    const resp = {
-      ok: !errorDetail,
-      show_id: activeShow.show_id,
-      show_name: activeShow.show_name,
-      action: actionLabel,
-      bulk_count: bulkCount || undefined,
-      counts
-    };
-    if (errorDetail) resp.error = errorDetail;
-    if (debug) resp.debug = { parsed, event };
-
-    return res.json(resp);
+    return res.json({
+      ok: true,
+      action,
+      list_id: list.list_id,
+      list_name: list.name,
+      counts,
+      speech,
+      line: affectedLine || undefined
+    });
   } catch (e) {
     console.error("list-runner/command error:", e);
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// --- /items/agents/list-runner/state --- read-only snapshot for UI/voice ---
+app.get("/items/agents/list-runner/state", async (req, res) => {
+  try {
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const ROOT = "agents/list-runner";
+    const LIB = `${ROOT}/lib`;
+    const LISTS = `${ROOT}/lists`;
+
+    async function readJson(rel, fallback) {
+      const url = `${baseUrl}/items/${rel}`;
+      const r = await fetchWithRetry(url, { method: "GET" });
+      if (r.status === 404) return fallback;
+      if (!r.ok) throw new Error(`read ${rel} ${r.status}`);
+      const text = await r.text();
+      if (!text) return fallback;
+      try {
+        return JSON.parse(text);
+      } catch (e) {
+        throw new Error(`parse ${rel}: ${e.message}`);
+      }
+    }
+
+    const [
+      showsLib,
+      horsesLib,
+      itemsLib,
+      listsLib,
+      locationsLib,
+      kitsLib,
+      startedRaw
+    ] = await Promise.all([
+      readJson(`${LIB}/shows_lib.json`, []),
+      readJson(`${LIB}/horses_lib.json`, []),
+      readJson(`${LIB}/items_lib.json`, []),
+      readJson(`${LIB}/lists_lib.json`, []),
+      readJson(`${LIB}/locations_lib.json`, []),
+      readJson(`${LIB}/kits_lib.json`, []),
+      readJson(`${LISTS}/started_lists.json`, { lists: [] })
+    ]);
+
+    const libs = {
+      shows: Array.isArray(showsLib) ? showsLib : showsLib.shows || [],
+      horses: Array.isArray(horsesLib) ? horsesLib : horsesLib.horses || [],
+      items: Array.isArray(itemsLib) ? itemsLib : itemsLib.items || [],
+      lists: Array.isArray(listsLib) ? listsLib : listsLib.lists || [],
+      locations: Array.isArray(locationsLib)
+        ? locationsLib
+        : locationsLib.locations || [],
+      kits: Array.isArray(kitsLib) ? kitsLib : kitsLib.kits || []
+    };
+
+    const started =
+      startedRaw && typeof startedRaw === "object"
+        ? startedRaw
+        : { lists: [] };
+    if (!Array.isArray(started.lists)) started.lists = [];
+
+    return res.json({
+      ok: true,
+      libs,
+      lists: started.lists
+    });
+  } catch (e) {
+    console.error("list-runner/state error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 
 // --- Startup ---
 const PORT = process.env.PORT || 3000;
