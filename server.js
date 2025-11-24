@@ -1238,41 +1238,40 @@ app.get("/items/agents/list-runner/state", async (req, res) => {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
-// --- /http-get — external fetch for runners ---
+
+// --- /http-get --- simple external fetch for runners ---
 app.get("/http-get", async (req, res) => {
-  const target = req.query.url;
-  if (!target || typeof target !== "string") {
-    return res.status(400).json({ error: "url query param required" });
-  }
-
-  let parsed;
   try {
-    parsed = new URL(target);
-  } catch {
-    return res.status(400).json({ error: "invalid_url" });
-  }
+    const url = String(req.query.url || "").trim();
+    if (!url) {
+      return res.status(400).json({ error: "url query param required" });
+    }
 
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return res.status(400).json({ error: "unsupported_protocol" });
-  }
+    // Very basic safety gate: only http(s) and no whitespace
+    if (!/^https?:\/\//i.test(url) || /\s/.test(url)) {
+      return res.status(400).json({ error: "invalid_url" });
+    }
 
-  try {
     const r = await fetchWithRetry(
-      target,
+      url,
       { method: "GET" },
-      { attempts: 2, timeoutMs: 15000 }
+      { attempts: 2, timeoutMs: 10000 }
     );
 
     const text = await r.text();
-    const type = r.headers.get("content-type") || "text/plain; charset=utf-8";
 
-    // Pass through upstream status; your runner can decide how to handle non-200
-    res.status(r.status).type(type).send(text || "");
+    // Pass through status; body is always plain text for the runner to parse
+    res
+      .status(r.status)
+      .type("text/plain; charset=utf-8")
+      .send(text);
   } catch (e) {
     console.error("http-get error:", e);
     res.status(500).json({ error: "http_get_failed", details: e.message });
   }
 });
+
+  
 
 
 // --- Startup ---
