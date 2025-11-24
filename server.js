@@ -1239,30 +1239,39 @@ app.get("/items/agents/list-runner/state", async (req, res) => {
   }
 });
 
-// --- /http-get --- simple external fetch for runners ---
+
+// --- /http-get — simple external fetch for runners ---
 app.get("/http-get", async (req, res) => {
   try {
     const url = String(req.query.url || "").trim();
+
     if (!url) {
       return res.status(400).json({ error: "url query param required" });
     }
 
-    // Very basic safety gate: only http(s) and no whitespace
-    if (!/^https?:\/\//i.test(url) || /\s/.test(url)) {
-      return res.status(400).json({ error: "invalid_url" });
+    // Only allow http/https
+    if (!/^https?:\/\//i.test(url)) {
+      return res.status(400).json({ error: "url must start with http:// or https://" });
     }
 
-    const r = await fetchWithRetry(
-      url,
-      { method: "GET" },
-      { attempts: 2, timeoutMs: 10000 }
-    );
+    const r = await fetchWithRetry(url, { method: "GET" }, { attempts: 2, timeoutMs: 10000 });
+
+    // Forward upstream status if not OK
+    if (!r.ok) {
+      return res.status(r.status).json({ error: `upstream_status_${r.status}` });
+    }
 
     const text = await r.text();
 
-    // Pass through status; body is always plain text for the runner to parse
+    // Soft 5 MB guard (approx by characters)
+    const MAX_CHARS = 5 * 1024 * 1024;
+    if (text.length > MAX_CHARS) {
+      return res.status(413).json({ error: "upstream_body_too_large" });
+    }
+
+    // Return raw body as text
     res
-      .status(r.status)
+      .status(200)
       .type("text/plain; charset=utf-8")
       .send(text);
   } catch (e) {
@@ -1271,7 +1280,6 @@ app.get("/http-get", async (req, res) => {
   }
 });
 
-  
 
 
 // --- Startup ---
