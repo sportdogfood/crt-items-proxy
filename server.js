@@ -1254,12 +1254,12 @@ app.get("/http-get", async (req, res) => {
       return res.status(400).json({ error: "url must start with http:// or https://" });
     }
 
-    const r = await fetchWithRetry(url, { method: "GET" }, { attempts: 2, timeoutMs: 10000 });
-
-    // Forward upstream status if not OK
-    if (!r.ok) {
-      return res.status(r.status).json({ error: `upstream_status_${r.status}` });
-    }
+    // Fetch upstream (may be 200, 403, 404, etc.)
+    const r = await fetchWithRetry(
+      url,
+      { method: "GET" },
+      { attempts: 2, timeoutMs: 10000 }
+    );
 
     const text = await r.text();
 
@@ -1269,7 +1269,8 @@ app.get("/http-get", async (req, res) => {
       return res.status(413).json({ error: "upstream_body_too_large" });
     }
 
-    // Return raw body as text
+    // IMPORTANT: always return 200 so the connector does NOT surface a 4xx error
+    // The runner still receives the raw body and can decide how to handle it.
     res
       .status(200)
       .type("text/plain; charset=utf-8")
