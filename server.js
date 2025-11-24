@@ -1238,6 +1238,41 @@ app.get("/items/agents/list-runner/state", async (req, res) => {
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
+// --- /http-get — external fetch for runners ---
+app.get("/http-get", async (req, res) => {
+  const target = req.query.url;
+  if (!target || typeof target !== "string") {
+    return res.status(400).json({ error: "url query param required" });
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(target);
+  } catch {
+    return res.status(400).json({ error: "invalid_url" });
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return res.status(400).json({ error: "unsupported_protocol" });
+  }
+
+  try {
+    const r = await fetchWithRetry(
+      target,
+      { method: "GET" },
+      { attempts: 2, timeoutMs: 15000 }
+    );
+
+    const text = await r.text();
+    const type = r.headers.get("content-type") || "text/plain; charset=utf-8";
+
+    // Pass through upstream status; your runner can decide how to handle non-200
+    res.status(r.status).type(type).send(text || "");
+  } catch (e) {
+    console.error("http-get error:", e);
+    res.status(500).json({ error: "http_get_failed", details: e.message });
+  }
+});
 
 
 // --- Startup ---
