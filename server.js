@@ -1281,12 +1281,11 @@ app.get("/http-get", async (req, res) => {
   }
 });
 
-// --- /crt/run — generic runner command endpoint ---
+// --- /crt/run — generic runner trigger (top/bottom/blog wrapper) ---
 app.post("/crt/run", async (req, res) => {
   try {
-    const { runner, creation_id, mode, meta } = req.body || {};
+    const { runner, creation_id, mode } = req.body || {};
 
-    // Basic required fields
     if (!runner || !creation_id) {
       return res.status(400).json({
         ok: false,
@@ -1294,84 +1293,26 @@ app.post("/crt/run", async (req, res) => {
       });
     }
 
-    const safeRunner = String(runner).trim();
-    const safeId = String(creation_id).trim();
-
-    // Simple safety on id/runner tokens
-    const tokenRe = /^[a-z0-9._-]+$/i;
-    if (!tokenRe.test(safeRunner) || !tokenRe.test(safeId)) {
-      return res.status(400).json({
-        ok: false,
-        error: "runner and creation_id must be simple tokens (a–z, 0–9, . _ -)"
-      });
-    }
-
-    const nowIso = new Date().toISOString();
-    const tsSlug = nowIso.replace(/[:.]/g, "-");
-
-    // Normalized command payload (what gets written to items/*)
-    const command = {
-      runner: safeRunner,
-      creation_id: safeId,
-      mode: mode || "main",
-      meta: meta || {},
-      ts: nowIso,
-      source: "crt-items-proxy"
-    };
-
-    // Where we store the command JSON in items/*
-    const commandPath = `items/agents/${safeRunner}/commands/${safeId}-${tsSlug}.json`;
-
-    const baseUrl = `${req.protocol}://${req.get("host")}`;
-    const commitUrl = `${baseUrl}/items/commit-bulk`;
-
-    const body = {
-      message: `crt-run ${safeRunner} ${safeId}`,
-      overwrite: true,
-      files: [
-        {
-          path: commandPath,
-          content_base64: Buffer.from(
-            JSON.stringify(command, null, 2) + "\n",
-            "utf8"
-          ).toString("base64"),
-          content_type: "application/json"
-        }
-      ]
-    };
-
-    const r = await fetchWithRetry(commitUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    });
-
-    const out = await r.json().catch(() => ({}));
-
-    if (!r.ok || out.ok === false) {
-      return res.status(r.status || 500).json({
-        ok: false,
-        error: out.error || "commit_failed",
-        details: out.details || null
-      });
-    }
-
+    // For now this is just a stub/echo so we can prove the route is live.
+    // Later, this is where you will call the corresponding runner
+    // (top/bottom/blog) via the OpenAPI plugin or internal logic.
     return res.json({
       ok: true,
-      runner: safeRunner,
-      creation_id: safeId,
-      mode: mode || "main",
-      command_path: commandPath,
-      commit: out.commit || null
+      where: "crt-items-proxy",
+      runner,
+      creation_id,
+      mode: mode || "main"
     });
   } catch (e) {
-    console.error("crt/run error:", e);
+    console.error("POST /crt/run error:", e);
     return res.status(500).json({
       ok: false,
-      error: e.message
+      error: "crt_run_failed",
+      details: e.message
     });
   }
 });
+
 
 
 // --- Startup ---
