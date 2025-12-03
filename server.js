@@ -1281,30 +1281,85 @@ app.get("/http-get", async (req, res) => {
   }
 });
 
-// --- /crt/run — generic runner trigger (top/bottom/blog wrapper) ---
+// --- /crt/run — generic runner entry (TOP / BOTTOM / BLOG stub) ---
 app.post("/crt/run", async (req, res) => {
   try {
-    const { runner, creation_id, mode } = req.body || {};
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {});
+    const { runner, creation_id, mode } = body;
 
     if (!runner || !creation_id) {
       return res.status(400).json({
         ok: false,
-        error: "runner and creation_id required"
+        error: "runner and creation_id are required"
       });
     }
 
-    // For now this is just a stub/echo so we can prove the route is live.
-    // Later, this is where you will call the corresponding runner
-    // (top/bottom/blog) via the OpenAPI plugin or internal logic.
-    return res.json({
-      ok: true,
-      where: "crt-items-proxy",
+    // Only allow known runners for now
+    const RUNNER_SEGMENTS = {
+      "crt-top-runner": "top",
+      "crt-bottom-runner": "bottom",
+      "crt-blog-runner": "blog"
+    };
+
+    const segment = RUNNER_SEGMENTS[runner];
+    if (!segment) {
+      return res.status(400).json({
+        ok: false,
+        error: `unsupported_runner: ${runner}`
+      });
+    }
+
+    const where = "crt-items-proxy";
+    const modeSafe = mode || "main";
+    const ts = new Date().toISOString();
+
+    const pingJson = {
       runner,
       creation_id,
-      mode: mode || "main"
+      mode: modeSafe,
+      where,
+      ts
+    };
+
+    const logPath = `docs/runner/${segment}/logs/${creation_id}-ping.json`;
+
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const commitUrl = `${baseUrl}/docs/commit`;
+
+    const r = await fetchWithRetry(
+      commitUrl,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({
+          path: logPath,
+          json: pingJson,
+          message: `crt-run ping ${runner} ${creation_id}`
+        })
+      },
+      { attempts: 2, timeoutMs: 10000 }
+    );
+
+    const out = await r.json().catch(() => ({}));
+    if (!r.ok || out.error) {
+      return res.status(r.status || 500).json({
+        ok: false,
+        error: out.error || "docs_commit_failed",
+        details: out.details || null
+      });
+    }
+
+    return res.json({
+      ok: true,
+      where,
+      runner,
+      creation_id,
+      mode: modeSafe,
+      log_path: logPath,
+      commit: out.commit || null
     });
   } catch (e) {
-    console.error("POST /crt/run error:", e);
+    console.error("/crt/run error:", e);
     return res.status(500).json({
       ok: false,
       error: "crt_run_failed",
@@ -1312,6 +1367,7 @@ app.post("/crt/run", async (req, res) => {
     });
   }
 });
+
 
 
 
