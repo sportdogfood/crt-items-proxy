@@ -1367,6 +1367,99 @@ app.post("/crt/run", async (req, res) => {
     });
   }
 });
+// --- /feed/commit — commit FeedBoard JSON (+ optional print HTML) without client base64 ---
+app.post("/feed/commit", async (req, res) => {
+  try {
+    const {
+      board,                 // required: object or array
+      print_html = null,     // optional: string
+      message = "chore: update feed board",
+      overwrite = true
+    } = req.body || {};
+
+    if (board === undefined || board === null) {
+      return res.status(400).json({ ok: false, error: "board required" });
+    }
+
+    // Optional guard: reject duplicate/invalid boardNumber if present
+    const rows =
+      Array.isArray(board) ? board :
+      (board && Array.isArray(board.rows)) ? board.rows :
+      (board && Array.isArray(board.horses)) ? board.horses :
+      (board && Array.isArray(board.items)) ? board.items :
+      null;
+
+    if (rows) {
+      const seen = new Map(); // boardNumber -> first index
+      for (let i = 0; i < rows.length; i++) {
+        const bnRaw = rows[i]?.boardNumber;
+        if (bnRaw === undefined || bnRaw === null || bnRaw === "") continue;
+
+        const bn = Number(bnRaw);
+        if (!Number.isFinite(bn) || bn <= 0) {
+          return res.status(400).json({
+            ok: false,
+            error: `invalid_boardNumber at index ${i}`
+          });
+        }
+        if (seen.has(bn)) {
+          return res.status(409).json({
+            ok: false,
+            error: "duplicate_boardNumber",
+            boardNumber: bn,
+            first_index: seen.get(bn),
+            dup_index: i
+          });
+        }
+        seen.set(bn, i);
+      }
+    }
+
+    const boardStr = JSON.stringify(board, null, 2) + "\n";
+
+    const files = [
+      {
+        path: "docs/feed/data/latest/feed_board.json",
+        content_type: "application/json",
+        content_base64: Buffer.from(boardStr, "utf8").toString("base64")
+      }
+    ];
+
+    if (typeof print_html === "string" && print_html.trim()) {
+      const htmlStr = String(print_html).replace(/\r\n?/g, "\n");
+      files.push({
+        path: "docs/feed/data/latest/feed_board_print.html",
+        content_type: "text/html",
+        content_base64: Buffer.from(htmlStr, "utf8").toString("base64")
+      });
+    }
+
+    const baseUrl = `${req.protocol}://${req.get("host")}`;
+    const r = await fetchWithRetry(
+      `${baseUrl}/docs/commit-bulk`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+        body: JSON.stringify({ message, overwrite: !!overwrite, files })
+      },
+      { attempts: 2, timeoutMs: 10000 }
+    );
+
+    const out = await r.json().catch(() => ({}));
+    if (!r.ok || out.ok === false) {
+      return res.status(r.status || 500).json({
+        ok: false,
+        error: out.error || "commit_failed",
+        details: out.details || out
+      });
+    }
+
+    return res.json(out);
+  } catch (e) {
+    console.error("/feed/commit error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 
 
