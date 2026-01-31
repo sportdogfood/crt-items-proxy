@@ -44,7 +44,7 @@ app.use((req, _res, next) => {
 });
 
 // --- Helpers ---
-const allowedExt = /\.(json|txt|html|xml|csv|ndjson|md|tmpl|css)$/i;
+const allowedExt = /\.(json|txt|html|xml|csv|ndjson|md|tmpl|css|js)$/i;
 
 const safePath = (rel) =>
   typeof rel === "string" &&
@@ -326,7 +326,7 @@ app.post("/docs/commit-bulk", async (req, res) => {
     };
 
     // PATCH: validate each file path and extension and ensure docs/ prefix
-    const allowedBulkExt = /\.(html|xml|json)$/i;
+    const allowedBulkExt = /\.(html|xml|json|js)$/i;
     for (const [i, f] of files.entries()) {
       if (!f || !f.path || !f.content_base64) {
         return res.status(400).json({ error: `files[${i}] requires path and content_base64` });
