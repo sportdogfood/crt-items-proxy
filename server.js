@@ -308,9 +308,13 @@ app.post("/docs/commit", async (req, res) => {
 });
 
 // --- /docs/commit-bulk — Structure Runner (7-file blog publish) ---
+// --- /docs/commit-bulk — Structure Runner (7-file blog publish) ---
 app.post("/docs/commit-bulk", async (req, res) => {
   try {
-    const { message, overwrite, files } = req.body || {};
+    // PATCH: accept both `overwrite` and legacy `force`
+    const { message, overwrite, force, files } = req.body || {};
+    const shouldForce = (overwrite === true) || (force === true);
+
     if (!Array.isArray(files) || files.length === 0)
       return res.status(400).json({ error: "files[] required" });
 
@@ -405,10 +409,10 @@ app.post("/docs/commit-bulk", async (req, res) => {
     const newCommit = await commitPost.json();
     if (!commitPost.ok) return res.status(commitPost.status).json({ error: `commit-post ${commitPost.status}`, details: newCommit });
 
-    // move ref
+    // move ref (PATCH: use shouldForce)
     const refPatch = await fetchWithRetry(
       refUrl,
-      { method: "PATCH", headers, body: JSON.stringify({ sha: newCommit.sha, force: !!overwrite }) },
+      { method: "PATCH", headers, body: JSON.stringify({ sha: newCommit.sha, force: shouldForce }) },
       { attempts: 2, timeoutMs: 7000 }
     );
     if (!refPatch.ok) {
@@ -435,6 +439,10 @@ app.post("/docs/commit-bulk", async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+
+
+
 // --- /items/commit-bulk — Bulk commit to items/* (runner writes data assets) ---
 app.post("/items/commit-bulk", async (req, res) => {
   try {
